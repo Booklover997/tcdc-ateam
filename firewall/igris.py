@@ -48,7 +48,7 @@ RULE_COMMENT = "igris_auto"
 WHITELIST_COMMENT = "igris_whitelist"
 
 DEFAULT_WHITELISTED_IPS = [
-    "10.113.10.53",
+    "10.112.10.53",
 ]
 
 UBUNTU_PACKAGE_IPS = [
