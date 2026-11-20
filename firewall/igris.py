@@ -1,31 +1,35 @@
 #!/usr/bin/env python3
 """
-outbound_guard.py — Monitor and individually block outbound connections
-based on SOURCE PORT.
+igris.py — Monitor /var/log/ufw.log for outbound connections and block
+destinations reached from non-whitelisted source ports.
 
-Checks the local source port of every outbound connection. If a process
-sends traffic from a port not in the allowed list, it gets an individual
-iptables DROP rule (--sport) and the connection is killed. Destination
-IP/port don't matter.
+Reactive approach:
+  1. UFW allows all outbound by default and logs it
+  2. This script tails /var/log/ufw.log in real time
+  3. When it sees an outbound connection with a source port NOT in the
+     whitelist, it runs: ufw deny out proto <tcp|udp> to <dst_ip> port <dport>
+  4. That UFW rule blocks all future outbound traffic to that destination
 
-NO default-deny-all rule. Each blocked source port gets its own specific
-iptables rule.
+The first connection gets through (that's how it appears in the log),
+then the rule catches everything after.
 
-Three interception modes (auto-selected, best available):
-  1. nfqueue  — inspects each outbound packet before it leaves.
-  2. conntrack — monitors conntrack events, adds rules reactively.
-  3. polling  — scans /proc/net, adds rules reactively.
+IP Whitelist:
+  --whitelist-ips lets you pre-allow destination IPs (e.g. package repos).
+  These IPs are added as UFW allow rules with comment 'igris_whitelist'.
+  --remove-whitelist removes all whitelist rules (toggle off).
 
-Tested on Ubuntu Server 24.04 LTS (iptables-nft backend, Python 3.12+).
+Prerequisites (installed automatically with --setup):
+  - ufw (enabled, default allow outgoing, logging high)
+  - rsyslog (writes kernel log to /var/log/ufw.log)
 
 Usage:
-    sudo python3 outbound_guard.py --ports 80,443,53,22
-    sudo python3 outbound_guard.py --ports 80,443 --log /var/log/guard.log
-    sudo python3 outbound_guard.py --config ports.conf
-    sudo python3 outbound_guard.py --check
-    sudo python3 outbound_guard.py --teardown
+    sudo python3 igris.py --setup
+    sudo python3 igris.py --ports 22,2222,80
+    sudo python3 igris.py --ports 22,2222 --whitelist-ips 91.189.91.83,185.125.190.36
+    sudo python3 igris.py --remove-whitelist
+    sudo python3 igris.py --teardown
 
-Requires root (iptables).
+Requires root.
 """
 
 import argparse
@@ -34,18 +38,36 @@ import os
 import re
 import shutil
 import signal
-import socket
-import struct
 import subprocess
 import sys
-import threading
 import time
-from collections import defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
 
-CHAIN_NAME = "OUTBOUND_GUARD"
-NFQUEUE_NUM = 42
+UFW_LOG = "/var/log/ufw.log"
+RULE_COMMENT = "igris_auto"
+WHITELIST_COMMENT = "igris_whitelist"
+
+DEFAULT_WHITELISTED_IPS = [
+    "10.113.10.53",
+]
+
+UBUNTU_PACKAGE_IPS = [
+    "91.189.91.83",
+    "91.189.91.82",
+    "185.125.190.36",
+    "185.125.190.39",
+    "91.189.88.142",
+    "91.189.88.152",
+    "91.189.91.81",
+    "91.189.91.80",
+]
+
+UBUNTU_PACKAGE_HOSTS = [
+    "archive.ubuntu.com",
+    "security.ubuntu.com",
+    "ppa.launchpad.net",
+    "changelogs.ubuntu.com",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +76,7 @@ NFQUEUE_NUM = 42
 
 def check_root():
     if os.geteuid() != 0:
-        print("Error: must run as root (iptables requires it).", file=sys.stderr)
+        print("Error: must run as root.", file=sys.stderr)
         sys.exit(1)
 
 
@@ -71,7 +93,6 @@ def has_cmd(name):
 
 
 def parse_ports(spec):
-    """Parse comma-separated ports / ranges like 80,443,8000-8010."""
     ports = set()
     for token in spec.split(","):
         token = token.strip()
@@ -102,161 +123,241 @@ def load_config_file(path):
     return parse_ports(",".join(tokens))
 
 
-def conntrack_available():
-    """Check if conntrack subsystem is functional (module loaded or built-in)."""
-    # Check /proc/modules (loaded as module)
-    try:
-        with open("/proc/modules") as f:
-            if "nf_conntrack" in f.read():
-                return True
-    except OSError:
-        pass
-    # Check /proc/net/nf_conntrack (built into kernel — common in containers)
-    if Path("/proc/net/nf_conntrack").exists():
-        return True
-    # Check sysctl (another built-in indicator)
-    if Path("/proc/sys/net/netfilter/nf_conntrack_max").exists():
-        return True
-    # Last resort: try to load the module
-    modprobe = shutil.which("modprobe") or "/sbin/modprobe"
-    try:
-        r = run([modprobe, "nf_conntrack"], check=False)
-        if r.returncode == 0:
-            return True
-    except FileNotFoundError:
-        pass
-    return False
-
-
-def ensure_conntrack_module():
-    """Ensure conntrack subsystem is available."""
-    if conntrack_available():
-        return True
-    print("[!] Warning: conntrack subsystem not available", file=sys.stderr)
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Process lookup — works with or without ss
-# ---------------------------------------------------------------------------
-
-def find_process(dst_ip, dst_port, proto):
-    """Best-effort process lookup. Tries ss first, falls back to /proc/net."""
-    if has_cmd("ss"):
-        return _find_process_ss(dst_ip, dst_port, proto)
-    return _find_process_proc(dst_ip, dst_port, proto)
-
-
-def _find_process_ss(dst_ip, dst_port, proto):
-    flag = "-tnp" if proto == "tcp" else "-unp"
-    result = run(["ss", flag, "dst", f"{dst_ip}:{dst_port}"], check=False)
-    if result.returncode == 0:
-        for line in result.stdout.splitlines()[1:]:
-            match = re.search(r'users:\(\("([^"]+)",pid=(\d+)', line)
-            if match:
-                return f"{match.group(1)}[{match.group(2)}]"
-    return None
-
-
-def _find_process_proc(dst_ip, dst_port, proto):
-    """Parse /proc/net/tcp or /proc/net/udp to find the owning process."""
-    try:
-        proc_file = f"/proc/net/{proto}"
-        dst_hex = _ip_to_hex(dst_ip)
-        port_hex = f"{dst_port:04X}"
-
-        with open(proc_file) as f:
-            for line in f.readlines()[1:]:
-                fields = line.split()
-                if len(fields) < 10:
-                    continue
-                rem_addr = fields[2]
-                rem_ip, rem_port = rem_addr.split(":")
-                if rem_ip == dst_hex and rem_port == port_hex:
-                    inode = fields[9]
-                    return _inode_to_process(inode)
-    except (OSError, ValueError):
-        pass
-    return None
-
-
-def _ip_to_hex(ip_str):
-    """Convert dotted IP to the hex format used in /proc/net/*."""
-    packed = socket.inet_aton(ip_str)
-    return f"{struct.unpack('<I', packed)[0]:08X}"
-
-
-def _inode_to_process(inode):
-    """Find the process owning a socket inode by scanning /proc/*/fd."""
-    target = f"socket:[{inode}]"
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        fd_dir = pid_dir / "fd"
+def resolve_hosts(hosts):
+    """Resolve hostnames to IPs."""
+    ips = set()
+    for host in hosts:
         try:
-            for fd in fd_dir.iterdir():
-                try:
-                    if os.readlink(str(fd)) == target:
-                        comm = (pid_dir / "comm").read_text().strip()
-                        return f"{comm}[{pid_dir.name}]"
-                except OSError:
-                    continue
-        except OSError:
+            r = run(["getent", "hosts", host], check=False)
+            if r.returncode == 0:
+                for line in r.stdout.strip().splitlines():
+                    ip = line.split()[0]
+                    ips.add(ip)
+        except Exception:
+            pass
+    return sorted(ips)
+
+
+# ---------------------------------------------------------------------------
+# IP Whitelist
+# ---------------------------------------------------------------------------
+
+def add_whitelist(ips):
+    """Add UFW allow out rules for whitelisted destination IPs."""
+    added = 0
+    for ip in ips:
+        ip = ip.strip()
+        if not ip:
             continue
-    return None
+        r = run([
+            "ufw", "allow", "out",
+            "to", ip,
+            "comment", WHITELIST_COMMENT,
+        ], check=False)
+        if r.returncode == 0:
+            print(f"    ufw allow out to {ip}")
+            added += 1
+        elif "existing" in (r.stdout + r.stderr).lower():
+            print(f"    (already exists) ufw allow out to {ip}")
+        else:
+            err = r.stderr.strip() or r.stdout.strip()
+            print(f"    [!] Failed: {ip}: {err}")
+    return added
+
+
+def remove_whitelist():
+    """Remove all UFW rules with the whitelist comment."""
+    print("[*] Removing igris whitelist rules...")
+    r = run(["ufw", "status", "numbered"], check=False)
+    if r.returncode != 0:
+        print("[!] Could not get ufw status")
+        return
+
+    rules_to_delete = []
+    for line in r.stdout.splitlines():
+        m = re.match(r"\[\s*(\d+)\]", line)
+        if m and WHITELIST_COMMENT in line:
+            rules_to_delete.append(int(m.group(1)))
+
+    for num in sorted(rules_to_delete, reverse=True):
+        run(["ufw", "--force", "delete", str(num)], check=False)
+        print(f"    Removed whitelist rule #{num}")
+
+    if rules_to_delete:
+        print(f"[+] Removed {len(rules_to_delete)} whitelist rules.")
+    else:
+        print("[+] No whitelist rules found.")
 
 
 # ---------------------------------------------------------------------------
-# Individual rule tracker
+# Setup / teardown
 # ---------------------------------------------------------------------------
 
-class RuleTracker:
-    def __init__(self, log_file=None, log_allowed=False):
-        self._lock = threading.Lock()
-        self._blocked = set()
-        self._stats = defaultdict(int)
-        self._log_allowed = log_allowed
+def setup():
+    """Install and configure ufw + rsyslog for outbound logging."""
+    print("[*] Installing ufw and rsyslog...")
+    r = run(["apt-get", "install", "-y", "-qq", "ufw", "rsyslog"], check=False)
+    if r.returncode != 0:
+        print(f"[!] apt-get failed: {r.stderr.strip()}", file=sys.stderr)
+
+    # Start rsyslog
+    run(["pkill", "rsyslogd"], check=False)
+    time.sleep(0.5)
+    run(["rsyslogd"], check=False)
+
+    # Enable UFW
+    run(["ufw", "--force", "enable"], check=False)
+    run(["ufw", "default", "allow", "outgoing"], check=False)
+    run(["ufw", "logging", "high"], check=False)
+
+    # Ensure log file exists
+    if not os.path.exists(UFW_LOG):
+        with open(UFW_LOG, "w"):
+            pass
+
+    # Verify rsyslog has the ufw config
+    r = run(["grep", "-r", "UFW", "/etc/rsyslog.d/"], check=False)
+    if r.returncode != 0:
+        print("[!] No UFW rsyslog config found in /etc/rsyslog.d/")
+        print("    Creating /etc/rsyslog.d/20-ufw.conf...")
+        with open("/etc/rsyslog.d/20-ufw.conf", "w") as f:
+            f.write(':msg,contains,"[UFW " /var/log/ufw.log\n')
+        run(["pkill", "-HUP", "rsyslogd"], check=False)
+
+    # Verify
+    time.sleep(1)
+    pgrep = run(["pgrep", "-a", "rsyslog"], check=False)
+    ufw_status = run(["ufw", "status", "verbose"], check=False)
+
+    print()
+    print("[+] Setup complete:")
+    print(f"    rsyslog: {'running' if pgrep.returncode == 0 else 'NOT running'}")
+    print(f"    ufw: enabled, logging high")
+    print(f"    log file: {UFW_LOG}")
+    print()
+    if "allow (outgoing)" in ufw_status.stdout:
+        print("[+] UFW default outgoing: allow — outbound traffic will be logged")
+    else:
+        print("[!] Warning: UFW outgoing policy may not be 'allow'")
+    print()
+    print("You can now run:")
+    print("    sudo python3 igris.py --ports 22,2222,80")
+
+
+def teardown():
+    """Remove all ufw rules added by this script (blocks + whitelist)."""
+    print("[*] Removing igris rules...")
+    r = run(["ufw", "status", "numbered"], check=False)
+    if r.returncode != 0:
+        print("[!] Could not get ufw status")
+        return
+
+    rules_to_delete = []
+    for line in r.stdout.splitlines():
+        m = re.match(r"\[\s*(\d+)\]", line)
+        if m and (RULE_COMMENT in line or WHITELIST_COMMENT in line or "igris_dns" in line):
+            rules_to_delete.append(int(m.group(1)))
+
+    if not rules_to_delete:
+        for line in r.stdout.splitlines():
+            m = re.match(r"\[\s*(\d+)\]", line)
+            if m and "DENY OUT" in line:
+                rules_to_delete.append(int(m.group(1)))
+
+    for num in sorted(rules_to_delete, reverse=True):
+        run(["ufw", "--force", "delete", str(num)], check=False)
+        print(f"    Removed rule #{num}")
+
+    if rules_to_delete:
+        print(f"[+] Removed {len(rules_to_delete)} rules.")
+    else:
+        print("[+] No igris rules found to remove.")
+
+
+# ---------------------------------------------------------------------------
+# Rule management
+# ---------------------------------------------------------------------------
+
+class RuleManager:
+    def __init__(self, log_file=None, whitelisted_ips=None):
+        self._blocked = {}  # {(proto, dst_ip, dst_port): timestamp}
+        self._whitelisted_ips = set(whitelisted_ips or [])
+        self._base_whitelisted_ips = set(DEFAULT_WHITELISTED_IPS)
         self._log_fh = None
         if log_file:
             self._log_fh = open(log_file, "a", buffering=1)
 
-    def already_blocked(self, proto, src_port):
-        return (proto, src_port) in self._blocked
+    def reload_whitelist_from_ufw(self):
+        """Re-read UFW rules to rebuild the whitelist from current state."""
+        new_wl = set(self._base_whitelisted_ips)
+        r = run(["ufw", "status"], check=False)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                if WHITELIST_COMMENT in line:
+                    m = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
+                    if m:
+                        new_wl.add(m.group(1))
+        old = self._whitelisted_ips
+        self._whitelisted_ips = new_wl
+        added = new_wl - old
+        removed = old - new_wl
+        self._log(f"[RELOAD] {ts()}  Whitelist reloaded: "
+                  f"{len(new_wl)} IPs (added {len(added)}, removed {len(removed)})")
 
-    def add_individual_rule(self, proto, src_port):
-        """Add a DROP rule for a specific outbound source port."""
-        key = (proto, src_port)
-        with self._lock:
-            if key in self._blocked:
-                return
-            run([
-                "iptables", "-A", CHAIN_NAME,
-                "-p", proto,
-                "--sport", str(src_port),
-                "-j", "DROP",
-            ])
-            self._blocked.add(key)
-            self._stats[src_port] += 1
+    def is_whitelisted(self, dst_ip):
+        return dst_ip in self._whitelisted_ips
 
-    def log(self, proto, src_ip, src_port, dst_ip, dst_port, action, proc=None):
-        if action == "ALLOWED" and not self._log_allowed:
+    def is_blocked(self, proto, dst_ip, dst_port):
+        return (proto, dst_ip, dst_port) in self._blocked
+
+    def add_block(self, proto, src_port, src_ip, dst_ip, dst_port):
+        """Add a UFW deny rule for the destination IP and port."""
+        key = (proto, dst_ip, dst_port)
+        if key in self._blocked:
             return
-        proc_str = f"  proc={proc}" if proc else ""
-        msg = (f"[{action}] {ts()}  {proto.upper()} "
-               f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}{proc_str}")
+
+        ufw_proto = proto.lower()
+        r = run([
+            "ufw", "deny", "out",
+            "proto", ufw_proto,
+            "to", dst_ip, "port", str(dst_port),
+            "comment", RULE_COMMENT,
+        ], check=False)
+
+        if r.returncode == 0:
+            self._blocked[key] = ts()
+            self._log(f"[BLOCKED] {ts()}  {proto.upper()} "
+                      f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}  "
+                      f"ufw deny out proto {ufw_proto} to {dst_ip} port {dst_port}")
+        else:
+            err = r.stderr.strip() or r.stdout.strip()
+            self._log(f"[ERROR] {ts()}  Failed to add rule for {dst_ip}:{dst_port}: {err}")
+
+    def _log(self, msg):
         print(msg)
         if self._log_fh:
             self._log_fh.write(msg + "\n")
 
+    def log_emergency(self, proto, src_port, src_ip, dst_ip, dst_port):
+        msg = (f"[EMERGENCY] {ts()}  {proto.upper()} "
+               f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}  "
+               f"UDP payload likely sent before rule applied")
+        print(msg)
+        if self._log_fh:
+            self._log_fh.write(msg + "\n")
+
+    def log_allowed(self, proto, src_port, src_ip, dst_ip, dst_port):
+        self._log(f"[ALLOWED] {ts()}  {proto.upper()} "
+                  f"sport={src_port} ({src_ip} -> {dst_ip}:{dst_port})")
+
     def print_summary(self):
-        with self._lock:
-            if not self._blocked:
-                print("\n--- No connections were blocked ---")
-                return
-            print(f"\n--- Summary: {len(self._blocked)} individual source-port block rules ---")
-            for proto, port in sorted(self._blocked):
-                count = self._stats[port]
-                print(f"  {proto.upper()} sport {port}: blocked ({count} connections seen)")
+        if not self._blocked:
+            print("\n--- No destinations were blocked ---")
+            return
+        print(f"\n--- Summary: {len(self._blocked)} destinations blocked via ufw ---")
+        for (proto, dst_ip, dst_port), when in sorted(self._blocked.items()):
+            print(f"  ufw deny out proto {proto} to {dst_ip} port {dst_port}  (added {when})")
+        print("\nTo remove all rules: sudo python3 igris.py --teardown")
 
     def close(self):
         if self._log_fh:
@@ -264,188 +365,85 @@ class RuleTracker:
 
 
 # ---------------------------------------------------------------------------
-# iptables chain management — NO default deny
+# Log tailer
 # ---------------------------------------------------------------------------
 
-def setup_chain():
-    teardown_chain()
-    run(["iptables", "-N", CHAIN_NAME])
+UFW_ALLOW_PATTERN = re.compile(
+    r"\[UFW ALLOW\]"
+    r".*?IN=\s*"            # empty IN = outbound
+    r"OUT=(\S+)"            # OUT=eth0
+    r".*?SRC=(\S+)"
+    r".*?DST=(\S+)"
+    r".*?PROTO=(\S+)"
+    r".*?SPT=(\d+)"
+    r".*?DPT=(\d+)"
+)
+
+# Also catch AUDIT entries (logged at high level for outbound)
+UFW_AUDIT_PATTERN = re.compile(
+    r"\[UFW AUDIT\]"
+    r".*?IN=\s*"
+    r"OUT=(\S+)"
+    r".*?SRC=(\S+)"
+    r".*?DST=(\S+)"
+    r".*?PROTO=(\S+)"
+    r".*?SPT=(\d+)"
+    r".*?DPT=(\d+)"
+)
 
 
-def setup_nfqueue(protocols):
-    for proto in protocols:
-        run([
-            "iptables", "-I", "OUTPUT", "1",
-            "-p", proto,
-            "-j", "NFQUEUE", "--queue-num", str(NFQUEUE_NUM),
-        ])
+def tail_ufw_log(allowed_set, manager, log_allowed=False):
+    """Tail /var/log/ufw.log and react to outbound ALLOW/AUDIT entries."""
 
-
-def setup_chain_jump(protocols):
-    """Jump OUTPUT into our chain — no ctstate filter so persistent
-    DROP --sport rules block ALL packets from that source port."""
-    for proto in protocols:
-        run([
-            "iptables", "-I", "OUTPUT", "1",
-            "-p", proto,
-            "-j", CHAIN_NAME,
-        ])
-
-
-def teardown_chain():
-    for proto in ("tcp", "udp"):
-        # Remove NFQUEUE jumps
-        while True:
-            r = run(["iptables", "-D", "OUTPUT",
-                      "-p", proto,
-                      "-j", "NFQUEUE", "--queue-num", str(NFQUEUE_NUM)],
-                     check=False)
-            if r.returncode != 0:
-                break
-        # Remove chain jumps
-        while True:
-            r = run(["iptables", "-D", "OUTPUT",
-                      "-p", proto,
-                      "-j", CHAIN_NAME], check=False)
-            if r.returncode != 0:
-                break
-    run(["iptables", "-F", CHAIN_NAME], check=False)
-    run(["iptables", "-X", CHAIN_NAME], check=False)
-
-
-def show_rules():
-    r = run(["iptables", "-L", CHAIN_NAME, "-n", "--line-numbers"], check=False)
-    if r.returncode == 0 and r.stdout.strip():
-        print(f"\n--- {CHAIN_NAME} individual rules ---")
-        print(r.stdout)
-
-
-# ---------------------------------------------------------------------------
-# Mode 1: NFQUEUE
-# ---------------------------------------------------------------------------
-
-def run_nfqueue_mode(allowed_ports, protocols, tracker):
-    from netfilterqueue import NetfilterQueue
-
-    allowed_set = set(allowed_ports)
-
-    def packet_handler(pkt):
-        try:
-            payload = pkt.get_payload()
-            ip_proto = payload[9]
-            src_ip = ".".join(str(b) for b in payload[12:16])
-            dst_ip = ".".join(str(b) for b in payload[16:20])
-            ihl = (payload[0] & 0x0F) * 4
-
-            # src_port = bytes 0-1, dst_port = bytes 2-3 of transport header
-            if ip_proto in (6, 17):
-                src_port = (payload[ihl] << 8) | payload[ihl + 1]
-                dst_port = (payload[ihl + 2] << 8) | payload[ihl + 3]
-                proto = "tcp" if ip_proto == 6 else "udp"
-            else:
-                pkt.accept()
-                return
-
-            if dst_ip == "127.0.0.1" or src_port in allowed_set:
-                pkt.accept()
-                return
-
-            tracker.add_individual_rule(proto, src_port)
-            proc = find_process(dst_ip, dst_port, proto)
-            tracker.log(proto, src_ip, src_port, dst_ip, dst_port, "BLOCKED", proc)
-            pkt.accept()
-
-        except Exception as e:
-            print(f"[!] Packet handler error: {e}", file=sys.stderr)
-            pkt.accept()
-
-    setup_chain()
-    setup_chain_jump(protocols)
-    setup_nfqueue(protocols)
-
-    nfq = NetfilterQueue()
-    nfq.bind(NFQUEUE_NUM, packet_handler)
-    print("[+] NFQUEUE mode active — inspecting each connection individually")
-    try:
-        nfq.run()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        nfq.unbind()
-
-
-# ---------------------------------------------------------------------------
-# Mode 2: conntrack monitor
-# ---------------------------------------------------------------------------
-
-def kill_connection(proto, src_port, dst_ip=None, dst_port=None):
-    """Kill a connection by source port."""
-    if has_cmd("conntrack"):
-        run([
-            "conntrack", "-D",
-            "-p", proto, "--sport", str(src_port),
-        ], check=False)
-    if proto == "tcp" and has_cmd("ss") and dst_ip and dst_port:
-        run(["ss", "-K", "sport", "=", str(src_port),
-             "dst", dst_ip, "dport", "=", str(dst_port)],
-            check=False)
-
-
-def run_conntrack_mode(allowed_ports, protocols, tracker):
-    allowed_set = set(allowed_ports)
-
-    setup_chain()
-    setup_chain_jump(protocols)
-
-    cmd = ["conntrack", "-E", "-e", "NEW", "-o", "extended"]
-    print("[+] Conntrack monitor mode — checking source port of each new connection")
-    print("    (first packet may leave before the rule is added)")
-
-    pattern = re.compile(
-        r"src=(\S+)\s+dst=(\S+)\s+sport=(\d+)\s+dport=(\d+)"
+    proc = subprocess.Popen(
+        ["tail", "-F", "-n", "0", UFW_LOG],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
     )
-    proto_pattern = re.compile(r"proto=(\d+)")
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    seen_conns = set()
 
     try:
         for line in proc.stdout:
-            if "127.0.0.1" in line:
-                continue
-
-            pm = proto_pattern.search(line)
-            if not pm:
-                continue
-            ip_proto = int(pm.group(1))
-            if ip_proto == 6:
-                proto = "tcp"
-            elif ip_proto == 17:
-                proto = "udp"
-            else:
-                continue
-
-            if proto not in protocols:
-                continue
-
-            m = pattern.search(line)
+            m = UFW_ALLOW_PATTERN.search(line)
+            if not m:
+                m = UFW_AUDIT_PATTERN.search(line)
             if not m:
                 continue
 
-            src_ip, dst_ip = m.group(1), m.group(2)
-            src_port = int(m.group(3))
-            dst_port = int(m.group(4))
+            iface = m.group(1)
+            src_ip = m.group(2)
+            dst_ip = m.group(3)
+            proto = m.group(4).lower()
+            src_port = int(m.group(5))
+            dst_port = int(m.group(6))
+
+            if not iface:
+                continue
+
+            if dst_ip.startswith("127.") or dst_ip == src_ip:
+                continue
 
             if src_port in allowed_set:
-                tracker.log(proto, src_ip, src_port, dst_ip, dst_port, "ALLOWED")
+                if log_allowed:
+                    manager.log_allowed(proto, src_port, src_ip, dst_ip, dst_port)
                 continue
 
-            if tracker.already_blocked(proto, src_port):
+            if manager.is_whitelisted(dst_ip):
                 continue
 
-            proc_name = find_process(dst_ip, dst_port, proto)
-            tracker.log(proto, src_ip, src_port, dst_ip, dst_port, "BLOCKED", proc_name)
-            tracker.add_individual_rule(proto, src_port)
-            kill_connection(proto, src_port, dst_ip, dst_port)
+            conn_key = (proto, dst_ip, dst_port)
+            if conn_key in seen_conns:
+                continue
+            seen_conns.add(conn_key)
+
+            if manager.is_blocked(proto, dst_ip, dst_port):
+                continue
+
+            if proto == "udp":
+                manager.log_emergency(proto, src_port, src_ip, dst_ip, dst_port)
+            manager.add_block(proto, src_port, src_ip, dst_ip, dst_port)
 
     except KeyboardInterrupt:
         pass
@@ -454,240 +452,84 @@ def run_conntrack_mode(allowed_ports, protocols, tracker):
 
 
 # ---------------------------------------------------------------------------
-# Mode 3: polling via /proc/net (no ss or conntrack needed)
-# ---------------------------------------------------------------------------
-
-def _parse_proc_net(proto):
-    """Parse /proc/net/tcp or /proc/net/udp.
-    Returns (src_ip, src_port, dst_ip, dst_port, inode) for each active connection."""
-    conns = []
-    proc_path = f"/proc/net/{proto}"
-    try:
-        with open(proc_path) as f:
-            for line in f.readlines()[1:]:
-                fields = line.split()
-                if len(fields) < 10:
-                    continue
-                local = fields[1]
-                remote = fields[2]
-                state = fields[3]
-
-                # TCP: SYN_SENT(02), ESTABLISHED(01)
-                if proto == "tcp" and state not in ("01", "02"):
-                    continue
-
-                rem_ip_hex, rem_port_hex = remote.split(":")
-                loc_ip_hex, loc_port_hex = local.split(":")
-
-                src_port = int(loc_port_hex, 16)
-                dst_port = int(rem_port_hex, 16)
-                if dst_port == 0:
-                    continue
-
-                dst_ip_int = int(rem_ip_hex, 16)
-                dst_ip = socket.inet_ntoa(struct.pack("<I", dst_ip_int))
-
-                src_ip_int = int(loc_ip_hex, 16)
-                src_ip = socket.inet_ntoa(struct.pack("<I", src_ip_int))
-
-                inode = fields[9]
-                conns.append((src_ip, src_port, dst_ip, dst_port, inode))
-    except OSError:
-        pass
-    return conns
-
-
-def run_polling_mode(allowed_ports, protocols, tracker, interval=0.5):
-    allowed_set = set(allowed_ports)
-
-    setup_chain()
-    setup_chain_jump(protocols)
-
-    print(f"[+] Polling mode (/proc/net) — scanning source ports every {interval}s")
-    print("    (first packet may leave before the rule is added)")
-
-    seen = set()
-
-    while True:
-        for proto in protocols:
-            for src_ip, src_port, dst_ip, dst_port, inode in _parse_proc_net(proto):
-                if dst_ip in ("127.0.0.1", "0.0.0.0"):
-                    continue
-
-                conn_key = (proto, src_ip, src_port, dst_ip, dst_port)
-                if conn_key in seen:
-                    continue
-                seen.add(conn_key)
-
-                if src_port in allowed_set:
-                    tracker.log(proto, src_ip, src_port, dst_ip, dst_port, "ALLOWED")
-                    continue
-
-                if tracker.already_blocked(proto, src_port):
-                    continue
-
-                proc_name = _inode_to_process(inode)
-                tracker.log(proto, src_ip, src_port, dst_ip, dst_port, "BLOCKED", proc_name)
-                tracker.add_individual_rule(proto, src_port)
-                kill_connection(proto, src_port, dst_ip, dst_port)
-
-        time.sleep(interval)
-
-
-# ---------------------------------------------------------------------------
-# Dependency check
-# ---------------------------------------------------------------------------
-
-def check_dependencies(requested_mode):
-    """Check and report what's available, what's missing."""
-    print("=== Dependency Check (Ubuntu Server 24.04) ===\n")
-
-    # iptables
-    ok = has_cmd("iptables")
-    ver = run(["iptables", "--version"], check=False).stdout.strip() if ok else ""
-    backend = "(nf_tables)" if "nf_tables" in ver else "(legacy)"
-    _dep_line("iptables", ok, ver, "sudo apt install iptables")
-    if ok and "nf_tables" in ver:
-        print(f"         backend: nf_tables — compatible\n")
-
-    # conntrack CLI
-    ok_ct = has_cmd("conntrack")
-    _dep_line("conntrack", ok_ct, "", "sudo apt install conntrack")
-
-    # ss (iproute2)
-    ok_ss = has_cmd("ss")
-    _dep_line("ss (iproute2)", ok_ss, "", "sudo apt install iproute2")
-
-    # nf_conntrack subsystem (module or built-in)
-    ct_ok = conntrack_available()
-    ct_note = ""
-    if ct_ok:
-        if Path("/proc/net/nf_conntrack").exists() or \
-           Path("/proc/sys/net/netfilter/nf_conntrack_max").exists():
-            ct_note = " (built-in)"
-    _dep_line("nf_conntrack", ct_ok, f"available{ct_note}" if ct_ok else "",
-              "sudo modprobe nf_conntrack  (or: sudo apt install kmod)")
-
-    # Python NetfilterQueue
-    nfq = False
-    try:
-        import netfilterqueue  # noqa: F401
-        nfq = True
-    except ImportError:
-        pass
-    _dep_line("NetfilterQueue (python)", nfq, "",
-              "sudo apt install python3-dev libnetfilter-queue-dev && pip install NetfilterQueue")
-
-    # Mode availability
-    print("\n--- Mode availability ---")
-    modes = {
-        "nfqueue":   nfq and ok and ct_ok,
-        "conntrack": ok_ct and ok and ct_ok,
-        "polling":   ok,  # only needs iptables + /proc/net
-    }
-    for mode, avail in modes.items():
-        status = "READY" if avail else "missing deps"
-        marker = "+" if avail else "!"
-        print(f"  [{marker}] {mode:12s} {status}")
-
-    if requested_mode and requested_mode != "auto":
-        if not modes.get(requested_mode, False):
-            print(f"\n[!] Requested mode '{requested_mode}' is not available. "
-                  f"Install the missing dependencies above.")
-            return False
-
-    best = next((m for m, a in modes.items() if a), None)
-    if best:
-        print(f"\n[+] Best available mode: {best}")
-    else:
-        print("\n[!] No mode available — install at least iptables.")
-        return False
-
-    return True
-
-
-def _dep_line(name, ok, ver, install_cmd):
-    marker = "+" if ok else "!"
-    status = "installed" if ok else "MISSING"
-    ver_str = f" ({ver})" if ver else ""
-    print(f"  [{marker}] {name:25s} {status}{ver_str}")
-    if not ok:
-        print(f"         install: {install_cmd}")
-
-
-# ---------------------------------------------------------------------------
-# Mode selection
-# ---------------------------------------------------------------------------
-
-def select_mode():
-    try:
-        import netfilterqueue  # noqa: F401
-        if has_cmd("iptables"):
-            return "nfqueue"
-    except ImportError:
-        pass
-    if has_cmd("conntrack") and has_cmd("iptables"):
-        return "conntrack"
-    if has_cmd("iptables"):
-        return "polling"
-    print("Error: iptables not found.", file=sys.stderr)
-    sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Monitor and block outbound connections by SOURCE PORT. "
-                    "If a process sends from a port not in the allowed list, "
-                    "it gets an individual iptables --sport DROP rule.",
-        epilog="Ubuntu 24.04: sudo apt install iptables conntrack iproute2",
+        description="Monitor UFW logs for outbound connections and block "
+                    "destinations reached from non-whitelisted source ports.",
+        epilog="Requires: ufw, rsyslog. Run --setup first.",
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         "--ports", type=str,
-        help="Comma-separated allowed SOURCE ports/ranges (e.g. 80,443,53,22)")
+        help="Comma-separated allowed source ports/ranges (e.g. 22,2222,80)")
     group.add_argument(
         "--config", type=str,
         help="Config file with one port/range per line")
     group.add_argument(
-        "--teardown", action="store_true",
-        help="Remove all outbound_guard rules and exit")
+        "--setup", action="store_true",
+        help="Install and configure ufw + rsyslog, then exit")
     group.add_argument(
-        "--check", action="store_true",
-        help="Check dependencies and available modes, then exit")
+        "--teardown", action="store_true",
+        help="Remove all ufw rules added by this script")
+    group.add_argument(
+        "--remove-whitelist", action="store_true",
+        help="Remove all whitelist allow rules (toggle off)")
+    group.add_argument(
+        "--add-whitelist", action="store_true",
+        help="Add whitelist rules and exit (use with --whitelist-packages / --whitelist-ips)")
+    parser.add_argument(
+        "--whitelist-ips", type=str, default=None,
+        help="Comma-separated destination IPs to allow (bypass blocking)")
+    parser.add_argument(
+        "--whitelist-packages", action="store_true",
+        help="Auto-whitelist Ubuntu package repository IPs")
     parser.add_argument(
         "--log", type=str, default=None,
-        help="Log file path for blocked connections")
-    parser.add_argument(
-        "--proto", type=str, default="tcp,udp",
-        help="Protocols to filter (default: tcp,udp)")
-    parser.add_argument(
-        "--mode", choices=["nfqueue", "conntrack", "polling", "auto"],
-        default="auto",
-        help="Interception mode (default: auto-detect best available)")
-    parser.add_argument(
-        "--poll-interval", type=float, default=0.5,
-        help="Seconds between polls in polling mode (default: 0.5)")
+        help="Log file for blocked/allowed entries")
     parser.add_argument(
         "--log-allowed", action="store_true",
         help="Also log allowed connections (verbose)")
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Print config and exit without installing rules")
+        help="Print config and exit without monitoring")
     args = parser.parse_args()
 
     check_root()
 
-    if args.check:
-        ok = check_dependencies(args.mode if args.mode != "auto" else None)
-        sys.exit(0 if ok else 1)
+    if args.setup:
+        setup()
+        return
 
     if args.teardown:
-        teardown_chain()
-        print("[+] All outbound_guard iptables rules removed.")
+        teardown()
+        return
+
+    if args.remove_whitelist:
+        remove_whitelist()
+        return
+
+    if args.add_whitelist:
+        wl_ips = set()
+        if args.whitelist_ips:
+            for ip in args.whitelist_ips.split(","):
+                ip = ip.strip()
+                if ip:
+                    wl_ips.add(ip)
+        if args.whitelist_packages:
+            print("[*] Resolving package repository IPs...")
+            resolved = resolve_hosts(UBUNTU_PACKAGE_HOSTS)
+            wl_ips |= set(UBUNTU_PACKAGE_IPS) | set(resolved)
+        if not wl_ips:
+            print("Error: use --whitelist-packages and/or --whitelist-ips with --add-whitelist",
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f"[*] Adding {len(wl_ips)} whitelist allow rules...")
+        add_whitelist(wl_ips)
+        run(["ufw", "reload"], check=False)
+        print(f"[+] Whitelist active. Remove with: sudo python3 igris.py --remove-whitelist")
         return
 
     if args.ports:
@@ -695,63 +537,84 @@ def main():
     else:
         allowed = load_config_file(args.config)
 
-    protocols = [p.strip().lower() for p in args.proto.split(",")]
-
     if not allowed:
         print("Error: no allowed ports specified.", file=sys.stderr)
         sys.exit(1)
 
-    # Ensure kernel module is loaded
-    ensure_conntrack_module()
+    allowed_set = set(allowed)
 
-    mode = args.mode if args.mode != "auto" else select_mode()
+    # Preflight checks
+    if not has_cmd("ufw"):
+        print("Error: ufw not installed. Run: sudo python3 igris.py --setup",
+              file=sys.stderr)
+        sys.exit(1)
 
-    # Validate the chosen mode's dependencies
-    if mode == "nfqueue":
-        try:
-            import netfilterqueue  # noqa: F401
-        except ImportError:
-            print("Error: NetfilterQueue not installed. Install it with:", file=sys.stderr)
-            print("  sudo apt install python3-dev libnetfilter-queue-dev", file=sys.stderr)
-            print("  pip install NetfilterQueue", file=sys.stderr)
-            print("Or use --mode conntrack / --mode polling", file=sys.stderr)
-            sys.exit(1)
-    elif mode == "conntrack":
-        if not has_cmd("conntrack"):
-            print("Error: conntrack not installed: sudo apt install conntrack",
-                  file=sys.stderr)
-            sys.exit(1)
+    r = run(["ufw", "status"], check=False)
+    if "inactive" in r.stdout.lower():
+        print("Error: ufw is not enabled. Run: sudo python3 igris.py --setup",
+              file=sys.stderr)
+        sys.exit(1)
 
-    print(f"[*] Allowed ports: {', '.join(str(p) for p in allowed)}")
-    print(f"[*] Protocols:     {', '.join(p.upper() for p in protocols)}")
-    print(f"[*] Mode:          {mode}")
-    print(f"[*] Policy:        INDIVIDUAL (no default-deny-all)")
+    if not os.path.exists(UFW_LOG):
+        print(f"Error: {UFW_LOG} does not exist. Run: sudo python3 igris.py --setup",
+              file=sys.stderr)
+        sys.exit(1)
+
+    pgrep = run(["pgrep", "rsyslogd"], check=False)
+    if pgrep.returncode != 0:
+        print("[!] rsyslog not running — starting it...")
+        run(["rsyslogd"], check=False)
+        time.sleep(1)
+
+    # Build IP whitelist
+    whitelisted_ips = set(DEFAULT_WHITELISTED_IPS)
+    if args.whitelist_ips:
+        for ip in args.whitelist_ips.split(","):
+            ip = ip.strip()
+            if ip:
+                whitelisted_ips.add(ip)
+
+    if args.whitelist_packages:
+        print("[*] Resolving Ubuntu package repository IPs...")
+        resolved = resolve_hosts(UBUNTU_PACKAGE_HOSTS)
+        pkg_ips = set(UBUNTU_PACKAGE_IPS) | set(resolved)
+        whitelisted_ips |= pkg_ips
+        print(f"    Found {len(pkg_ips)} package repo IPs")
+
+    if whitelisted_ips:
+        print(f"[*] Adding {len(whitelisted_ips)} whitelist allow rules...")
+        add_whitelist(whitelisted_ips)
+        run(["ufw", "reload"], check=False)
+        print(f"[+] Whitelist active. Remove with: sudo python3 igris.py --remove-whitelist")
+
+    print(f"[*] Allowed source ports: {', '.join(str(p) for p in allowed)}")
+    if whitelisted_ips:
+        print(f"[*] Whitelisted IPs: {', '.join(sorted(whitelisted_ips))}")
+    print(f"[*] Watching: {UFW_LOG}")
+    print(f"[*] Method: ufw deny out proto <tcp|udp> to <dst_ip> port <dst_port>")
     if args.log:
-        print(f"[*] Log file:      {args.log}")
+        print(f"[*] Log file: {args.log}")
 
     if args.dry_run:
-        print("[*] Dry run — no rules installed.")
+        print("[*] Dry run — not monitoring.")
         return
 
-    tracker = RuleTracker(log_file=args.log, log_allowed=args.log_allowed)
+    manager = RuleManager(log_file=args.log, whitelisted_ips=whitelisted_ips)
 
     def cleanup():
-        tracker.print_summary()
-        tracker.close()
-        teardown_chain()
-        print("[+] All outbound_guard rules removed. Clean exit.")
+        manager.print_summary()
+        manager.close()
 
     atexit.register(cleanup)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGHUP, lambda *_: manager.reload_whitelist_from_ufw())
 
-    print()
-    if mode == "nfqueue":
-        run_nfqueue_mode(allowed, protocols, tracker)
-    elif mode == "conntrack":
-        run_conntrack_mode(allowed, protocols, tracker)
-    else:
-        run_polling_mode(allowed, protocols, tracker, interval=args.poll_interval)
+    print(f"\n[+] Monitoring outbound connections (Ctrl+C to stop)...")
+    print(f"    First connection from a non-allowed source port goes through,")
+    print(f"    then ufw blocks all future traffic to that destination IP:port.\n")
+
+    tail_ufw_log(allowed_set, manager, log_allowed=args.log_allowed)
 
 
 if __name__ == "__main__":
