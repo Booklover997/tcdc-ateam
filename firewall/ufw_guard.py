@@ -190,36 +190,36 @@ def teardown():
 
 class RuleManager:
     def __init__(self, log_file=None):
-        self._blocked_ports = {}  # {(proto, port): timestamp}
+        self._blocked = {}  # {(proto, dst_ip, dst_port): timestamp}
         self._log_fh = None
         if log_file:
             self._log_fh = open(log_file, "a", buffering=1)
 
-    def is_blocked(self, proto, port):
-        return (proto, port) in self._blocked_ports
+    def is_blocked(self, proto, dst_ip, dst_port):
+        return (proto, dst_ip, dst_port) in self._blocked
 
     def add_block(self, proto, src_port, src_ip, dst_ip, dst_port):
-        """Add a UFW deny rule for this source port."""
-        key = (proto, src_port)
-        if key in self._blocked_ports:
+        """Add a UFW deny rule for the destination IP and port."""
+        key = (proto, dst_ip, dst_port)
+        if key in self._blocked:
             return
 
         ufw_proto = proto.lower()
         r = run([
             "ufw", "deny", "out",
             "proto", ufw_proto,
-            "from", "any", "port", str(src_port),
+            "to", dst_ip, "port", str(dst_port),
             "comment", RULE_COMMENT,
         ], check=False)
 
         if r.returncode == 0:
-            self._blocked_ports[key] = ts()
+            self._blocked[key] = ts()
             self._log(f"[BLOCKED] {ts()}  {proto.upper()} "
-                      f"sport={src_port} ({src_ip} -> {dst_ip}:{dst_port})  "
-                      f"ufw deny out proto {ufw_proto} from any port {src_port}")
+                      f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}  "
+                      f"ufw deny out proto {ufw_proto} to {dst_ip} port {dst_port}")
         else:
             err = r.stderr.strip() or r.stdout.strip()
-            self._log(f"[ERROR] {ts()}  Failed to add rule for sport={src_port}: {err}")
+            self._log(f"[ERROR] {ts()}  Failed to add rule for {dst_ip}:{dst_port}: {err}")
 
     def _log(self, msg):
         print(msg)
@@ -231,12 +231,12 @@ class RuleManager:
                   f"sport={src_port} ({src_ip} -> {dst_ip}:{dst_port})")
 
     def print_summary(self):
-        if not self._blocked_ports:
-            print("\n--- No source ports were blocked ---")
+        if not self._blocked:
+            print("\n--- No destinations were blocked ---")
             return
-        print(f"\n--- Summary: {len(self._blocked_ports)} source ports blocked via ufw ---")
-        for (proto, port), when in sorted(self._blocked_ports.items()):
-            print(f"  ufw deny out proto {proto} from any port {port}  (added {when})")
+        print(f"\n--- Summary: {len(self._blocked)} destinations blocked via ufw ---")
+        for (proto, dst_ip, dst_port), when in sorted(self._blocked.items()):
+            print(f"  ufw deny out proto {proto} to {dst_ip} port {dst_port}  (added {when})")
         print("\nTo remove all rules: sudo python3 ufw_guard.py --teardown")
 
     def close(self):
@@ -309,18 +309,18 @@ def tail_ufw_log(allowed_set, manager, log_allowed=False):
             if dst_ip == "127.0.0.1":
                 continue
 
-            # Dedup: only process each (proto, sport) once
-            conn_key = (proto, src_port)
-            if conn_key in seen_conns:
-                continue
-            seen_conns.add(conn_key)
-
             if src_port in allowed_set:
                 if log_allowed:
                     manager.log_allowed(proto, src_port, src_ip, dst_ip, dst_port)
                 continue
 
-            if manager.is_blocked(proto, src_port):
+            # Dedup: only process each (proto, dst_ip, dst_port) once
+            conn_key = (proto, dst_ip, dst_port)
+            if conn_key in seen_conns:
+                continue
+            seen_conns.add(conn_key)
+
+            if manager.is_blocked(proto, dst_ip, dst_port):
                 continue
 
             manager.add_block(proto, src_port, src_ip, dst_ip, dst_port)
@@ -411,7 +411,7 @@ def main():
 
     print(f"[*] Allowed source ports: {', '.join(str(p) for p in allowed)}")
     print(f"[*] Watching: {UFW_LOG}")
-    print(f"[*] Method: ufw deny out proto <tcp|udp> from any port <sport>")
+    print(f"[*] Method: ufw deny out proto <tcp|udp> to <dst_ip> port <dst_port>")
     if args.log:
         print(f"[*] Log file: {args.log}")
 
@@ -430,8 +430,8 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 
     print(f"\n[+] Monitoring outbound connections (Ctrl+C to stop)...")
-    print(f"    First connection from a non-allowed port goes through,")
-    print(f"    then ufw blocks all future traffic from that source port.\n")
+    print(f"    First connection from a non-allowed source port goes through,")
+    print(f"    then ufw blocks all future traffic to that destination IP:port.\n")
 
     tail_ufw_log(allowed_set, manager, log_allowed=args.log_allowed)
 

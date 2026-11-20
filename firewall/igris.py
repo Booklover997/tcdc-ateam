@@ -350,10 +350,10 @@ def run_nfqueue_mode(allowed_ports, protocols, tracker):
                 pkt.accept()
                 return
 
-            pkt.drop()
+            tracker.add_individual_rule(proto, src_port)
             proc = find_process(dst_ip, dst_port, proto)
             tracker.log(proto, src_ip, src_port, dst_ip, dst_port, "BLOCKED", proc)
-            tracker.add_individual_rule(proto, src_port)
+            pkt.accept()
 
         except Exception as e:
             print(f"[!] Packet handler error: {e}", file=sys.stderr)
@@ -756,3 +756,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
