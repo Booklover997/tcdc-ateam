@@ -18,6 +18,7 @@ RED='\033[1;31m'
 GRN='\033[1;32m'
 YLW='\033[1;33m'
 BLU='\033[1;34m'
+DIM='\033[0;37m'
 RST='\033[0m'
 
 echo -e "${BLU}========================================${RST}"
@@ -32,23 +33,21 @@ apt-get update -qq
 
 PACKAGES=(
     # Logging
-    rsyslog auditd audispd-plugins syslog-ng
+    rsyslog auditd audispd-plugins
     # Netfilter / firewall
-    libnetfilter-queue-dev python3-nfqueue nftables iptables-persistent
+    libnetfilter-queue-dev nftables iptables-persistent
     ufw fail2ban
     # Network analysis
-    tcpdump wireshark-common tshark nmap netcat-openbsd
+    tcpdump nmap netcat-openbsd
     net-tools iproute2 dnsutils whois traceroute mtr-tiny
     # Monitoring
-    iftop nethogs iotop-c htop bmon nload
+    iftop nethogs iotop-c htop nload
     lsof strace ltrace sysstat
     # Hardening
-    apparmor apparmor-utils apparmor-profiles apparmor-profiles-extra
-    aide rkhunter chkrootkit clamav clamav-daemon
+    apparmor apparmor-utils apparmor-profiles
+    rkhunter chkrootkit clamav clamav-daemon
     libpam-pwquality libpam-google-authenticator
-    lynis
-    # Services
-    openssh-server nginx apache2
+    lynis aide
     # Build tools
     build-essential python3 python3-pip python3-venv python3-dev
     # Utilities
@@ -60,12 +59,18 @@ PACKAGES=(
     cryptsetup
 )
 
+apt-get install -y "${PACKAGES[@]}" 2>&1 | while IFS= read -r line; do
+    echo -e "  ${DIM}$line${RST}"
+done
+echo -e "${GRN}  Done.${RST}"
+
+echo ""
+echo -e "${YLW}  Verifying...${RST}"
 for pkg in "${PACKAGES[@]}"; do
-    [[ "$pkg" == \#* ]] && continue
-    if apt-get install -y -qq "$pkg" 2>/dev/null; then
+    if dpkg -s "$pkg" &>/dev/null; then
         echo -e "  ${GRN}✓${RST} $pkg"
     else
-        echo -e "  ${RED}✗${RST} $pkg (not available, skipped)"
+        echo -e "  ${RED}✗${RST} $pkg (failed to install)"
     fi
 done
 echo -e "${GRN}  Done.${RST}"
