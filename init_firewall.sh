@@ -112,8 +112,10 @@ for p in "${PORT_LIST[@]}"; do
         echo "    ufw allow in $p"
     fi
 done
-ufw allow out to 10.113.10.53 port 53 comment "igris_dns"
-echo "    ufw allow out to 10.113.10.53 port 53 (DNS)"
+ufw allow out to 10.112.10.53 port 53 comment "igris_dns"
+echo "    ufw allow out to 10.112.10.53 port 53 (DNS)"
+ufw allow out to 10.112.20.88 port 53 comment "igris_dns"
+echo "    ufw allow out to 10.112.20.88 port 53 (AD DNS)"
 ufw reload
 echo "[+] UFW enabled: deny inbound (except allowed ports), allow outbound, logging high."
 
