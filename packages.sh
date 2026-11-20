@@ -18,7 +18,6 @@ RED='\033[1;31m'
 GRN='\033[1;32m'
 YLW='\033[1;33m'
 BLU='\033[1;34m'
-DIM='\033[0;37m'
 RST='\033[0m'
 
 echo -e "${BLU}========================================${RST}"
@@ -48,6 +47,8 @@ PACKAGES=(
     rkhunter chkrootkit clamav clamav-daemon
     libpam-pwquality libpam-google-authenticator
     lynis aide
+    # WAF / web defense
+    libnginx-mod-http-naxsi libapache2-mod-security2 modsecurity-crs
     # Build tools
     build-essential python3 python3-pip python3-venv python3-dev
     # Utilities
@@ -59,21 +60,25 @@ PACKAGES=(
     cryptsetup
 )
 
-apt-get install -y "${PACKAGES[@]}" 2>&1 | while IFS= read -r line; do
-    echo -e "  ${DIM}$line${RST}"
-done
-echo -e "${GRN}  Done.${RST}"
+echo -e "  Installing ${#PACKAGES[@]} packages (with dependencies)..."
+apt-get install -y "${PACKAGES[@]}"
 
 echo ""
-echo -e "${YLW}  Verifying...${RST}"
+echo -e "${YLW}  Verifying installs...${RST}"
+FAILED=0
 for pkg in "${PACKAGES[@]}"; do
     if dpkg -s "$pkg" &>/dev/null; then
         echo -e "  ${GRN}✓${RST} $pkg"
     else
-        echo -e "  ${RED}✗${RST} $pkg (failed to install)"
+        echo -e "  ${RED}✗${RST} $pkg (FAILED)"
+        FAILED=$((FAILED + 1))
     fi
 done
-echo -e "${GRN}  Done.${RST}"
+if [ $FAILED -gt 0 ]; then
+    echo -e "  ${RED}$FAILED package(s) failed to install${RST}"
+else
+    echo -e "${GRN}  All packages installed.${RST}"
+fi
 
 # --- Step 2: Reinstall all currently installed packages ---
 echo ""
@@ -130,4 +135,5 @@ echo -e "  PATH updated in:    ${BASHRC_DEFAULT}"
 echo -e "  New shells will use ${BINARIES_DIR}/bin/ first."
 echo -e "  To use now:  ${YLW}source ${BASHRC_DEFAULT}${RST}"
 echo -e "${BLU}========================================${RST}"
+
 
