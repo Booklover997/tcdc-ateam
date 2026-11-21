@@ -1049,17 +1049,18 @@ section_lock_users() {
 
   printf 'Lock all accounts except whiteteam, blackteam, and nigel1-5.\n'
   if [[ "$SSH_MODE" -eq 1 ]]; then
-    printf 'SSH mode: OS/system users (uid < 1000) are skipped.\n'
+    printf 'SSH mode: scoring users are skipped (scoring engine needs password login).\n'
   fi
 
   while IFS=: read -r name x uid x x home shell; do
     [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    [[ "$name" == root ]] && continue
 
     in_list "$name" "${LOCK_EXEMPT[@]}" && { skip "lock $name (exempt)"; continue; }
 
-    if [[ "$uid" -lt 1000 ]]; then
-      [[ "$SSH_MODE" -eq 1 ]] && { skip "lock $name (OS user, --ssh mode)"; continue; }
-      [[ "$name" == root ]] && continue
+    if [[ "$SSH_MODE" -eq 1 ]] && is_scoring_user "$name"; then
+      skip "lock $name (scoring user, --ssh mode)"
+      continue
     fi
 
     if usermod -L "$name" 2>/dev/null; then
