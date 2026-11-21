@@ -48,7 +48,7 @@ PACKAGES=(
     libpam-pwquality libpam-google-authenticator
     lynis aide
     # WAF / web defense
-    libnginx-mod-http-naxsi libapache2-mod-security2 modsecurity-crs
+    libapache2-mod-security2 modsecurity-crs
     # Build tools
     build-essential python3 python3-pip python3-venv python3-dev
     # Utilities
@@ -135,5 +135,4 @@ echo -e "  PATH updated in:    ${BASHRC_DEFAULT}"
 echo -e "  New shells will use ${BINARIES_DIR}/bin/ first."
 echo -e "  To use now:  ${YLW}source ${BASHRC_DEFAULT}${RST}"
 echo -e "${BLU}========================================${RST}"
-
 
