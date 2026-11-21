@@ -33,7 +33,10 @@ done
 
 [[ $USE_DEFAULT -eq 1 ]] && PORTS+=("${DEFAULT_PORTS[@]}")
 [[ ${#PORTS[@]} -eq 0 ]] && { echo "Need --default or --ports"; exit 1; }
-[[ $EUID -ne 0 ]] && { echo "Run with sudo -E"; exit 1; }
+# Auto-escalate to root, preserving SSH_CLIENT
+if [[ $EUID -ne 0 ]]; then
+    exec sudo SSH_CLIENT="$SSH_CLIENT" "$0" "$@"
+fi
 
 # --- Detect SSH client IP ---
 SSH_IP=""
