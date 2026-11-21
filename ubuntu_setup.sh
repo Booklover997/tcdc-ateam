@@ -342,9 +342,18 @@ section_dpkg_and_path() {
     done < "$f"
   done
 
-  local prof
+  local prof owner
   for prof in /etc/profile.d/*; do
     [[ -f "$prof" ]] || continue
+    owner=$(dpkg -S "$prof" 2>/dev/null || true)
+    if [[ -z "$owner" ]]; then
+      if grep -Eqs 'curl|wget|nc |ncat|/dev/tcp|base64.*decode|eval ' "$prof"; then
+        backup_file "$prof"
+        rm -f "$prof"
+        fail "removed planted profile.d script: $prof"
+        continue
+      fi
+    fi
     n=0
     while IFS= read -r line || [[ -n "$line" ]]; do
       n=$((n + 1))
@@ -702,10 +711,23 @@ clean_sudoers_file() {
 }
 
 section_sudoers() {
-  local f
+  local f owner
   clean_sudoers_file /etc/sudoers
   for f in /etc/sudoers.d/*; do
     [[ -f "$f" ]] || continue
+    if [[ "$f" == *.bak ]] && grep -qs NOPASSWD "$f"; then
+      backup_file "$f"
+      rm -f "$f"
+      fail "removed NOPASSWD backdoor: $f"
+      continue
+    fi
+    owner=$(dpkg -S "$f" 2>/dev/null || true)
+    if [[ -z "$owner" ]] && grep -qs NOPASSWD "$f"; then
+      backup_file "$f"
+      rm -f "$f"
+      fail "removed unpackaged NOPASSWD sudoers drop-in: $f"
+      continue
+    fi
     clean_sudoers_file "$f"
   done
 }
@@ -909,6 +931,38 @@ section_sshd_2222() {
     ok "started sshd on port 2222"
   else
     fail "failed to start sshd on port 2222"
+  fi
+}
+
+# --- 6b. Restrict port 22 to known users -------------------------------------
+
+section_ssh_allow() {
+  local config="/etc/ssh/sshd_config" allow_line users
+  if [[ ! -f "$config" ]]; then
+    fail "missing $config"
+    return
+  fi
+  backup_file "$config"
+
+  users=("${SCORING_USERS[@]}" "${NIGEL_USERS[@]}" blackteam whiteteam)
+  allow_line="AllowUsers ${users[*]}"
+
+  sed -i -E '/^[[:space:]]*#?[[:space:]]*AllowUsers[[:space:]]/d' "$config"
+  printf '%s\n' "$allow_line" >>"$config"
+  ok "added $allow_line"
+
+  if /usr/sbin/sshd -t -f "$config"; then
+    ok "sshd -t passed with AllowUsers"
+  else
+    fail "sshd -t failed after adding AllowUsers; restoring backup"
+    restore_file "$config" || true
+    return
+  fi
+
+  if systemctl is-active --quiet ssh 2>/dev/null; then
+    systemctl reload ssh || warn "ssh reload failed"
+  elif systemctl is-active --quiet sshd 2>/dev/null; then
+    systemctl reload sshd || warn "sshd reload failed"
   fi
 }
 
@@ -1214,10 +1268,32 @@ clear_suid_if_set() {
 }
 
 section_suid_and_tmp() {
-  local f c p
+  local f c p mode
   for f in "${SUID_MUST_CLEAR[@]}"; do
     clear_suid_if_set "$f"
   done
+
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    case "$f" in
+      /usr/bin/su|/usr/bin/passwd|/usr/bin/mount|/usr/bin/umount|/usr/bin/crontab)  continue ;;
+      /usr/bin/expiry|/usr/bin/gpasswd|/usr/bin/chsh|/usr/bin/chfn|/usr/bin/newgrp) continue ;;
+      /usr/lib/openssh/ssh-keysign|/usr/lib/dbus-*/dbus-daemon-launch-helper)       continue ;;
+      /usr/bin/pkexec|/usr/bin/sudo|/usr/bin/at|/usr/bin/wall|/usr/bin/ssh-agent)    continue ;;
+      /usr/lib/policykit-*/polkit-agent-helper-*|/usr/libexec/polkit-agent-helper-*) continue ;;
+      /usr/sbin/unix_chkpwd|/usr/sbin/pam_timestamp_check)                          continue ;;
+    esac
+    if [[ "$f" == /opt/* || "$f" == /var/tmp/* || "$f" == /tmp/* || "$f" == /dev/shm/* ]] ||
+       [[ "$(basename "$f")" == .* ]]; then
+      backup_file "$f"
+      rm -f "$f"
+      fail "removed planted SUID/SGID binary: $f"
+    else
+      mode=$(stat -c '%a' "$f")
+      warn "unexpected SUID/SGID: $f mode $mode"
+    fi
+  done < <(find / -xdev \( -perm -4000 -o -perm -2000 \) 2>/dev/null | grep -v '/docker' || true)
+
   for f in /tmp /var/tmp /dev/shm; do
     [[ -d "$f" ]] || continue
     chmod 1777 "$f"
@@ -1449,6 +1525,7 @@ main() {
   run_section systemd section_systemd
   run_section sudoers section_sudoers
   run_section ssh-2222 section_sshd_2222
+  run_section ssh-allow section_ssh_allow
   section_disable_root || { fail 'root-disable checks failed; later hardening stages were not run'; return 1; }
   run_section cron-respawn section_cron_respawn
   run_section lock-users section_lock_users
