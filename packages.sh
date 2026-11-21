@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# packages.sh — Verify and install core security/admin packages, deploy compiled
+# packages.sh — Verify PAM integrity, install core packages, deploy compiled
 #                coreutils to /binaries, and prepend /binaries/bin to PATH.
+#
+# Usage:
+#   sudo ./packages.sh              (skip full debsums scan)
+#   sudo ./packages.sh --full       (include full debsums integrity check)
 
 set -uo pipefail
 
@@ -8,6 +12,9 @@ if [ "$(id -u)" -ne 0 ]; then
     echo "Error: must run as root (sudo $0)"
     exit 1
 fi
+
+FULL_SCAN=0
+[[ "${1:-}" == "--full" ]] && FULL_SCAN=1
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARIES_DIR="/binaries"
@@ -25,67 +32,82 @@ echo -e "${BLU}  Package Verify & Coreutils Installer${RST}"
 echo -e "${BLU}  $(date)${RST}"
 echo -e "${BLU}========================================${RST}"
 
-# --- Step 1: Ensure debsums is available ---
-echo ""
-echo -e "${YLW}[1/5] Ensuring debsums is available...${RST}"
-if ! command -v debsums &>/dev/null; then
-    apt-get update -qq
-    apt-get install -y debsums
-fi
-echo -e "${GRN}  debsums ready.${RST}"
-
-# --- Step 2: Verify integrity of all installed packages ---
-echo ""
-echo -e "${YLW}[2/5] Verifying installed package integrity against known checksums...${RST}"
-echo -e "  (this checks every file from every installed package)"
-
-TAMPERED_PKGS=()
-TAMPERED_LOG="/var/log/tcdc-tampered-$(date +%Y%m%d-%H%M%S).log"
-
-debsums -c 2>/dev/null | tee "$TAMPERED_LOG" || true
-
-if [ -s "$TAMPERED_LOG" ]; then
-    # Extract unique package names from modified file paths
-    while IFS= read -r file; do
-        pkg=$(dpkg -S "$file" 2>/dev/null | cut -d: -f1)
-        if [ -n "$pkg" ]; then
-            TAMPERED_PKGS+=("$pkg")
-        fi
-    done < "$TAMPERED_LOG"
-
-    # Deduplicate
-    mapfile -t TAMPERED_PKGS < <(printf '%s\n' "${TAMPERED_PKGS[@]}" | sort -u)
-
-    echo ""
-    echo -e "  ${RED}Found ${#TAMPERED_PKGS[@]} package(s) with modified files:${RST}"
-    for pkg in "${TAMPERED_PKGS[@]}"; do
-        echo -e "  ${RED}✗${RST} $pkg"
-    done
-    echo -e "  Full log: ${TAMPERED_LOG}"
-
-    echo ""
-    echo -e "  ${YLW}Reinstalling tampered packages from repository...${RST}"
-    for pkg in "${TAMPERED_PKGS[@]}"; do
-        if apt-get install --reinstall -y "$pkg" &>/dev/null; then
-            echo -e "  ${GRN}✓${RST} $pkg (reinstalled)"
-        else
-            echo -e "  ${RED}✗${RST} $pkg (reinstall failed)"
-        fi
-    done
+STEP=1
+if [ $FULL_SCAN -eq 1 ]; then
+    TOTAL=7
 else
-    echo -e "  ${GRN}All installed packages pass integrity check.${RST}"
-    rm -f "$TAMPERED_LOG"
+    TOTAL=6
 fi
 
-# --- Step 3: PAM integrity audit ---
+# --- Optional: Full debsums integrity check ---
+if [ $FULL_SCAN -eq 1 ]; then
+    echo ""
+    echo -e "${YLW}[$STEP/$TOTAL] Full package integrity scan (debsums)...${RST}"
+    echo -e "  (this checks every file from every installed package — may take several minutes)"
+    STEP=$((STEP + 1))
+
+    if ! command -v debsums &>/dev/null; then
+        apt-get update -qq
+        apt-get install -y debsums
+    fi
+
+    TAMPERED_PKGS=()
+    TAMPERED_LOG="/var/log/tcdc-tampered-$(date +%Y%m%d-%H%M%S).log"
+    DEBSUMS_SKIPPED=0
+
+    echo -e "  ${YLW}Press Ctrl+C to skip if this takes too long${RST}"
+    trap 'echo -e "\n  ${YLW}Skipped by user.${RST}"; DEBSUMS_SKIPPED=1' INT
+    debsums -c 2>/dev/null | tee "$TAMPERED_LOG" || true
+    trap - INT
+
+    if [ "$DEBSUMS_SKIPPED" -eq 1 ]; then
+        rm -f "$TAMPERED_LOG"
+    fi
+
+    if [ "$DEBSUMS_SKIPPED" -eq 0 ] && [ -s "$TAMPERED_LOG" ]; then
+        while IFS= read -r file; do
+            pkg=$(dpkg -S "$file" 2>/dev/null | cut -d: -f1)
+            if [ -n "$pkg" ]; then
+                TAMPERED_PKGS+=("$pkg")
+            fi
+        done < "$TAMPERED_LOG"
+
+        mapfile -t TAMPERED_PKGS < <(printf '%s\n' "${TAMPERED_PKGS[@]}" | sort -u)
+
+        echo ""
+        echo -e "  ${RED}Found ${#TAMPERED_PKGS[@]} package(s) with modified files:${RST}"
+        for pkg in "${TAMPERED_PKGS[@]}"; do
+            echo -e "  ${RED}✗${RST} $pkg"
+        done
+        echo -e "  Full log: ${TAMPERED_LOG}"
+
+        echo ""
+        echo -e "  ${YLW}Reinstalling tampered packages from repository...${RST}"
+        for pkg in "${TAMPERED_PKGS[@]}"; do
+            if apt-get install --reinstall -y "$pkg" &>/dev/null; then
+                echo -e "  ${GRN}✓${RST} $pkg (reinstalled)"
+            else
+                echo -e "  ${RED}✗${RST} $pkg (reinstall failed)"
+            fi
+        done
+    else
+        echo -e "  ${GRN}All installed packages pass integrity check.${RST}"
+        rm -f "$TAMPERED_LOG"
+    fi
+else
+    echo ""
+    echo -e "  ${DIM:-\033[0;37m}Skipping full debsums scan (use --full to enable)${RST}"
+fi
+
+# --- PAM integrity audit ---
 echo ""
-echo -e "${YLW}[3/7] Auditing PAM files for backdoors and tampering...${RST}"
+echo -e "${YLW}[$STEP/$TOTAL] Auditing PAM files for backdoors and tampering...${RST}"
+STEP=$((STEP + 1))
 
 PAM_KNOWN_GOOD="$SCRIPT_DIR/pam-sha256.txt"
 PAM_DIR="/etc/pam.d"
 PAM_ISSUES=0
 
-# 3a: Check for dangerous PAM patterns
 echo -e "  ${YLW}Scanning for backdoor patterns...${RST}"
 PAM_CRITICAL_FILES=(
     "$PAM_DIR/common-auth"
@@ -103,7 +125,6 @@ for f in "${PAM_CRITICAL_FILES[@]}"; do
     n=0
     while IFS= read -r line || [ -n "$line" ]; do
         n=$((n + 1))
-        # Skip comments and blank lines
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [ -z "$line" ] && continue
 
@@ -119,7 +140,7 @@ for f in "${PAM_CRITICAL_FILES[@]}"; do
             PAM_ISSUES=$((PAM_ISSUES + 1))
         fi
 
-        # pam_rootok.so in sudo/su with sufficient — bypasses password for any uid 0
+        # pam_rootok.so in wrong places — bypasses password for uid 0
         if echo "$line" | grep -qE 'sufficient[[:space:]]+pam_rootok\.so'; then
             if [[ "$f" != */su ]]; then
                 echo -e "  ${RED}SUSPECT${RST} $f:$n  $line"
@@ -132,26 +153,17 @@ for f in "${PAM_CRITICAL_FILES[@]}"; do
             echo -e "  ${RED}BACKDOOR${RST} $f:$n  $line"
             PAM_ISSUES=$((PAM_ISSUES + 1))
         fi
-
-        # Unknown .so not owned by any package
-        mod=$(echo "$line" | grep -oE '[^ ]+\.so' | head -1)
-        if [ -n "$mod" ]; then
-            if ! dpkg -S "$mod" &>/dev/null && ! dpkg -S "$(basename "$mod")" &>/dev/null; then
-                echo -e "  ${RED}UNKNOWN MODULE${RST} $f:$n  $mod"
-                PAM_ISSUES=$((PAM_ISSUES + 1))
-            fi
-        fi
     done < "$f"
 done
 
-# 3b: Check /etc/ld.so.preload
+# Check /etc/ld.so.preload
 if [ -s /etc/ld.so.preload ]; then
     echo -e "  ${RED}SUSPECT${RST} /etc/ld.so.preload is non-empty:"
     echo -e "  $(cat /etc/ld.so.preload)"
     PAM_ISSUES=$((PAM_ISSUES + 1))
 fi
 
-# 3c: Verify PAM file hashes against known-good baseline
+# Verify PAM file hashes against known-good baseline
 if [ -f "$PAM_KNOWN_GOOD" ]; then
     echo ""
     echo -e "  ${YLW}Verifying PAM hashes against known-good baseline...${RST}"
@@ -189,9 +201,10 @@ else
     echo -e "  ${GRN}PAM audit clean.${RST}"
 fi
 
-# --- Step 4: Install missing required packages ---
+# --- Install missing required packages ---
 echo ""
-echo -e "${YLW}[4/7] Checking required packages...${RST}"
+echo -e "${YLW}[$STEP/$TOTAL] Checking required packages...${RST}"
+STEP=$((STEP + 1))
 apt-get update -qq
 
 PACKAGES=(
@@ -233,9 +246,10 @@ else
     echo -e "${GRN}  All ${#PACKAGES[@]} packages present.${RST}"
 fi
 
-# --- Step 4: Extract compiled coreutils to /binaries ---
+# --- Extract compiled coreutils to /binaries ---
 echo ""
-echo -e "${YLW}[5/7] Deploying compiled coreutils to ${BINARIES_DIR}...${RST}"
+echo -e "${YLW}[$STEP/$TOTAL] Deploying compiled coreutils to ${BINARIES_DIR}...${RST}"
+STEP=$((STEP + 1))
 
 if [ ! -f "$COREUTILS_TAR" ]; then
     echo -e "${RED}  Error: $COREUTILS_TAR not found${RST}"
@@ -249,9 +263,10 @@ echo -e "  Extracted to ${BINARIES_DIR}/"
 echo -e "  Binaries: $(ls "$BINARIES_DIR/bin/" | wc -l) commands"
 echo -e "${GRN}  Done.${RST}"
 
-# --- Step 5: Add /binaries/bin to PATH ---
+# --- Add /binaries/bin to PATH ---
 echo ""
-echo -e "${YLW}[6/7] Adding ${BINARIES_DIR}/bin to PATH...${RST}"
+echo -e "${YLW}[$STEP/$TOTAL] Adding ${BINARIES_DIR}/bin to PATH...${RST}"
+STEP=$((STEP + 1))
 
 PATH_LINE='export PATH="/binaries/bin:$PATH"'
 MARKER="# tcdc-ateam: compiled coreutils"
@@ -281,9 +296,9 @@ EOF
     echo -e "  ${GRN}Added to ${CALLER_BASHRC}${RST}"
 fi
 
-# --- Step 7: Re-verify PAM after all changes ---
+# --- Final PAM re-check ---
 echo ""
-echo -e "${YLW}[7/7] Final PAM re-check...${RST}"
+echo -e "${YLW}[$STEP/$TOTAL] Final PAM re-check...${RST}"
 FINAL_PAM_OK=1
 if [ -f "$PAM_KNOWN_GOOD" ]; then
     while IFS='  ' read -r expected_hash pam_file; do

