@@ -232,10 +232,28 @@ section_bashrc() {
   skel_hash=$(sha256sum -- "$skel" | awk '{print $1}')
   ok "skel bashrc $skel_hash"
 
+  if [[ -f /root/.bashrc ]]; then
+    local rh
+    rh=$(sha256sum -- /root/.bashrc | awk '{print $1}')
+    if [[ "$rh" != "$skel_hash" ]]; then
+      backup_file /root/.bashrc
+      if cp -a "$skel" /root/.bashrc; then
+        chown root:root /root/.bashrc
+        ok "replaced /root/.bashrc was $rh now $skel_hash"
+      else
+        fail "could not replace /root/.bashrc"
+        restore_file /root/.bashrc || true
+      fi
+    else
+      ok "/root/.bashrc matches skel $rh"
+    fi
+  fi
+
   while IFS=: read -r name x uid gid gecos home shell; do
     [[ "$uid" =~ ^[0-9]+$ ]] || continue
-    [[ "$uid" -ge 1000 ]] || continue
+    [[ "$name" == root ]] && continue
     [[ -d "$home" ]] || continue
+    [[ -d "$home/.bashrc" ]] && continue
     if [[ "$name" == blackteam || "$name" == whiteteam ]]; then
       skip "bashrc $name"
       hash_extra_dotfiles "$home"
@@ -443,8 +461,9 @@ purge_cron_dirs() {
   local dir f owner
   for dir in /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly; do
     [[ -d "$dir" ]] || continue
-    for f in "$dir"/*; do
+    for f in "$dir"/* "$dir"/.*; do
       [[ -e "$f" ]] || continue
+      [[ "$f" == */. || "$f" == */.. ]] && continue
       hands_off_path "$f" && { skip "cron file $f"; continue; }
       owner=$(dpkg -S "$f" 2>/dev/null || true)
       case "$owner" in
