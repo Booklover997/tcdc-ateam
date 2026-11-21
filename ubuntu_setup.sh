@@ -102,7 +102,8 @@ backup_file() {
 }
 
 restore_file() {
-  local f="$1" src="${BACKUP}${f}"
+  local f="$1"
+  local src="${BACKUP}${f}"
   if [[ -e "$src" || -L "$src" ]]; then
     if cp -a "$src" "$f"; then
       ok "restored $f from backup"
@@ -1283,14 +1284,24 @@ section_suid_and_tmp() {
       /usr/lib/policykit-*/polkit-agent-helper-*|/usr/libexec/polkit-agent-helper-*) continue ;;
       /usr/sbin/unix_chkpwd|/usr/sbin/pam_timestamp_check)                          continue ;;
     esac
+    local pkg_owner
+    pkg_owner=$(dpkg -S "$f" 2>/dev/null || true)
     if [[ "$f" == /opt/* || "$f" == /var/tmp/* || "$f" == /tmp/* || "$f" == /dev/shm/* ]] ||
        [[ "$(basename "$f")" == .* ]]; then
       backup_file "$f"
       rm -f "$f"
       fail "removed planted SUID/SGID binary: $f"
+    elif [[ "$f" == /usr/local/* || "$f" == /usr/lib/cargo/* ]] && [[ -z "$pkg_owner" ]]; then
+      backup_file "$f"
+      rm -f "$f"
+      fail "removed unpackaged SUID/SGID binary: $f"
+    elif [[ -z "$pkg_owner" ]]; then
+      backup_file "$f"
+      rm -f "$f"
+      fail "removed unpackaged SUID/SGID binary: $f"
     else
       mode=$(stat -c '%a' "$f")
-      warn "unexpected SUID/SGID: $f mode $mode"
+      warn "unexpected SUID/SGID: $f mode $mode (owned by ${pkg_owner%%:*})"
     fi
   done < <(find / -xdev \( -perm -4000 -o -perm -2000 \) 2>/dev/null | grep -v '/docker' || true)
 
@@ -1371,7 +1382,11 @@ section_fail2ban() {
   mkdir -p /etc/fail2ban
   backup_file "$jail_file"
   backup_file "$override"
-  cat >"$jail_file" <<'EOF'
+  local has_apache=false has_nginx=false
+  dpkg-query -W apache2 >/dev/null 2>&1 && has_apache=true
+  dpkg-query -W nginx >/dev/null 2>&1 && has_nginx=true
+
+  cat >"$jail_file" <<EOF
 [DEFAULT]
 bantime  = 15m
 findtime = 10m
@@ -1382,19 +1397,19 @@ bantime.increment = false
 enabled = true
 
 [apache-auth]
-enabled = true
+enabled = $has_apache
 
 [apache-badbots]
-enabled = true
+enabled = $has_apache
 
 [apache-noscript]
-enabled = true
+enabled = $has_apache
 
 [nginx-http-auth]
-enabled = true
+enabled = $has_nginx
 
 [nginx-botsearch]
-enabled = true
+enabled = $has_nginx
 
 [recidive]
 enabled = false
