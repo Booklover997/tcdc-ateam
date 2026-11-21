@@ -2,7 +2,7 @@
 # packages.sh — Reinstall core packages, deploy compiled coreutils to /binaries,
 #                and prepend /binaries/bin to PATH system-wide.
 
-set -euo pipefail
+set -uo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Error: must run as root (sudo $0)"
@@ -61,7 +61,7 @@ PACKAGES=(
 )
 
 echo -e "  Installing ${#PACKAGES[@]} packages (with dependencies)..."
-apt-get install -y "${PACKAGES[@]}"
+apt-get install -y "${PACKAGES[@]}" || true
 
 echo ""
 echo -e "${YLW}  Verifying installs...${RST}"
