@@ -5,6 +5,7 @@
 set -euo pipefail
 
 DEFAULT_PORTS=(22 21 80 8080 53)
+DEFAULT_EXCLUDE=(1514)
 
 usage() {
     cat <<EOF
@@ -12,6 +13,7 @@ Usage: sudo $0 [OPTIONS]
 
 Port filters (at least one required):
   -d,  --default               Monitor default ports: ${DEFAULT_PORTS[*]}
+                               Auto-excludes: ${DEFAULT_EXCLUDE[*]}
   --pi, --port-include PORTS   Ports to monitor (comma/space separated, repeatable)
   --px, --port-exclude PORTS   Ports to ignore (comma/space separated, repeatable)
 
@@ -71,9 +73,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Merge default ports into include list
+# Merge default ports into include list and default excludes
 if [[ $USE_DEFAULT -eq 1 ]]; then
     PORT_INCLUDE+=("${DEFAULT_PORTS[@]}")
+    PORT_EXCLUDE+=("${DEFAULT_EXCLUDE[@]}")
 fi
 
 if [[ ${#PORT_INCLUDE[@]} -eq 0 && ${#PORT_EXCLUDE[@]} -eq 0 ]]; then
@@ -158,10 +161,10 @@ fi
 # Port filter
 port_filter=""
 if [[ ${#final_ports[@]} -gt 0 ]]; then
-    port_expr=$(printf 'dst port %s or ' "${final_ports[@]}")
+    port_expr=$(printf 'port %s or ' "${final_ports[@]}")
     port_filter="(${port_expr% or })"
 elif [[ ${#PORT_EXCLUDE[@]} -gt 0 ]]; then
-    exc_expr=$(printf 'dst port %s or ' "${!exc_ports[@]}")
+    exc_expr=$(printf 'port %s or ' "${!exc_ports[@]}")
     port_filter="not (${exc_expr% or })"
 fi
 
@@ -175,7 +178,7 @@ if [[ ${#IP_INCLUDE[@]} -gt 0 ]]; then
     for ip in "${IP_INCLUDE[@]}"; do
         [[ -n ${seen_inc[$ip]:-} ]] && continue
         seen_inc[$ip]=1
-        inc_parts+=("src host $ip")
+        inc_parts+=("host $ip")
     done
     inc_joined=$(printf '%s or ' "${inc_parts[@]}")
     ip_filter+=" and (${inc_joined% or })"
@@ -190,7 +193,7 @@ for ip in "${IP_EXCLUDE[@]}"; do all_exc+=("$ip"); done
 for ip in "${all_exc[@]}"; do
     [[ -n ${seen_exc[$ip]:-} ]] && continue
     seen_exc[$ip]=1
-    ip_filter+=" and not src host $ip"
+    ip_filter+=" and not host $ip"
 done
 
 filter="${port_filter}${ip_filter}"
@@ -215,7 +218,8 @@ echo "================================================================"
 opts=(-i any -nn -l -tttt)
 [[ $HEXDUMP -eq 1 ]] && opts+=(-X)
 
-tcpdump "${opts[@]}" "$filter" \
+# shellcheck disable=SC2086
+tcpdump "${opts[@]}" $filter \
     | sed -u -E 's/, win [0-9]+//; s/, options \[[^]]*\]//' \
     | tee -a "$LOG"
 
