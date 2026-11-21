@@ -5,7 +5,6 @@
 set -euo pipefail
 
 DEFAULT_PORTS=(22 21 80 8080 53)
-DEFAULT_EXCLUDE=(1514)
 
 usage() {
     cat <<EOF
@@ -13,7 +12,6 @@ Usage: sudo $0 [OPTIONS]
 
 Port filters (at least one required):
   -d,  --default               Monitor default ports: ${DEFAULT_PORTS[*]}
-                               Auto-excludes: ${DEFAULT_EXCLUDE[*]}
   --pi, --port-include PORTS   Ports to monitor (comma/space separated, repeatable)
   --px, --port-exclude PORTS   Ports to ignore (comma/space separated, repeatable)
 
@@ -73,10 +71,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Merge default ports into include list and default excludes
+# Merge default ports into include list
 if [[ $USE_DEFAULT -eq 1 ]]; then
     PORT_INCLUDE+=("${DEFAULT_PORTS[@]}")
-    PORT_EXCLUDE+=("${DEFAULT_EXCLUDE[@]}")
 fi
 
 if [[ ${#PORT_INCLUDE[@]} -eq 0 && ${#PORT_EXCLUDE[@]} -eq 0 ]]; then
@@ -112,12 +109,18 @@ validate_port() {
     fi
 }
 
-# Auto-detect SSH client IP
+# Auto-detect SSH client IP (sudo strips $SSH_CLIENT, so try multiple methods)
 SSH_IP=""
 if [[ -n ${SSH_CLIENT:-} ]]; then
     SSH_IP=$(awk '{print $1}' <<< "$SSH_CLIENT")
-    echo "SSH client IP detected: $SSH_IP (auto-excluded)"
+elif [[ -n ${SUDO_USER:-} ]]; then
+    SSH_IP=$(who | grep "$SUDO_USER" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1 || true)
 fi
+if [[ -z $SSH_IP ]]; then
+    SSH_IP=$(ss -tn state established '( dport = :22 or sport = :22 )' 2>/dev/null \
+        | awk 'NR>1 {print $4}' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1 || true)
+fi
+[[ -n $SSH_IP ]] && echo "SSH client IP detected: $SSH_IP (auto-excluded both directions)"
 
 # Validate IPs
 for ip in "${IP_INCLUDE[@]}" "${IP_EXCLUDE[@]}"; do
@@ -178,22 +181,23 @@ if [[ ${#IP_INCLUDE[@]} -gt 0 ]]; then
     for ip in "${IP_INCLUDE[@]}"; do
         [[ -n ${seen_inc[$ip]:-} ]] && continue
         seen_inc[$ip]=1
-        inc_parts+=("host $ip")
+        inc_parts+=("src host $ip")
     done
     inc_joined=$(printf '%s or ' "${inc_parts[@]}")
     ip_filter+=" and (${inc_joined% or })"
 fi
 
-# --ip-exclude + interactive + SSH: not from these
-declare -A seen_exc
-all_exc=()
-[[ -n $SSH_IP ]] && all_exc+=("$SSH_IP")
-for ip in "${IP_EXCLUDE[@]}"; do all_exc+=("$ip"); done
+# SSH IP: exclude BOTH directions (not host = not src and not dst)
+if [[ -n $SSH_IP ]]; then
+    ip_filter+=" and not host $SSH_IP"
+fi
 
-for ip in "${all_exc[@]}"; do
+# --ip-exclude + interactive: exclude src only (you want to see traffic TO these)
+declare -A seen_exc
+for ip in "${IP_EXCLUDE[@]}"; do
     [[ -n ${seen_exc[$ip]:-} ]] && continue
     seen_exc[$ip]=1
-    ip_filter+=" and not host $ip"
+    ip_filter+=" and not src host $ip"
 done
 
 filter="${port_filter}${ip_filter}"
@@ -218,8 +222,7 @@ echo "================================================================"
 opts=(-i any -nn -l -tttt)
 [[ $HEXDUMP -eq 1 ]] && opts+=(-X)
 
-# shellcheck disable=SC2086
-tcpdump "${opts[@]}" $filter \
+tcpdump "${opts[@]}" "$filter" \
     | sed -u -E 's/, win [0-9]+//; s/, options \[[^]]*\]//' \
     | tee -a "$LOG"
 
