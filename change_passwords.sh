@@ -1,9 +1,7 @@
 #!/bin/bash
 # Rotate nigel and scoring OS user passwords on this Ubuntu box.
 #   sudo bash change_passwords.sh
-# Paste one password per account. Nothing is saved.
-# Extra names (blueteam score1 score2 patch) rotate only when
-# /etc/hawk-rotate-extras exists on this host.
+# Paste a different password twice for each account. Nothing is saved.
 
 set -uo pipefail
 
@@ -11,18 +9,26 @@ NIGEL_USERS=(nigel1 nigel2 nigel3 nigel4 nigel5)
 OS_USERS=(
   washington kennedy teddy lincoln ross streep franklin parks
   armstrong hamilton mlk tubman manziel deniro bush
+  blueteam score1 score2 patch
 )
-EXTRA_USERS=(blueteam score1 score2 patch)
 PROTECTED=(blackteam whiteteam root nobody)
-EXTRAS_FLAG=/etc/hawk-rotate-extras
+IMMUTABLE_FILES=(/etc/passwd /etc/shadow /etc/group /etc/gshadow)
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 LOG="/var/log/hawk-passwd-${STAMP}.log"
-HOST=$(hostname)
+COUNT_FILE="/var/log/hawk-passwd-${STAMP}.counts"
+CHATTR_LIFTED=0
 
-CHANGED=()
-FAILED=()
-SKIPPED=()
+ok() { printf 'OK %s\n' "$*"; printf 'OK\n' >>"$COUNT_FILE"; }
+warn() { printf 'WARN %s\n' "$*"; printf 'WARN\n' >>"$COUNT_FILE"; }
+fail() { printf 'FAIL %s\n' "$*"; printf 'FAIL\n' >>"$COUNT_FILE"; }
+skip() { printf 'SKIP %s\n' "$*"; printf 'SKIP\n' >>"$COUNT_FILE"; }
+
+count_of() {
+  local tag="$1"
+  [[ -f "$COUNT_FILE" ]] || { printf '0\n'; return; }
+  awk -v t="$tag" '$0 == t { n++ } END { print n + 0 }' "$COUNT_FILE"
+}
 
 in_list() {
   local needle="$1"
@@ -36,154 +42,133 @@ in_list() {
 
 is_protected() { in_list "$1" "${PROTECTED[@]}"; }
 
-pair() {
-  printf '%s / %s' "$HOST" "$1"
-}
-
 tty_say() {
   printf '%s\n' "$*" >/dev/tty
 }
 
-log_line() {
-  printf '%s\n' "$*"
-}
-
-mark_changed() {
-  CHANGED+=("$1")
-  log_line "CHANGED $1"
-}
-
-mark_failed() {
-  FAILED+=("$1")
-  log_line "FAILED $(pair "$1") — Linux lead: chpasswd did not take on this host"
-}
-
-mark_skipped() {
-  SKIPPED+=("$1")
-  log_line "SKIPPED $1"
-}
-
-remove_from_failed() {
-  local user="$1" i
-  local kept=()
-  for i in "${FAILED[@]+"${FAILED[@]}"}"; do
-    [[ "$i" == "$user" ]] && continue
-    kept+=("$i")
+restore_immutable() {
+  local f
+  [[ "$CHATTR_LIFTED" -eq 1 ]] || return 0
+  command -v chattr >/dev/null 2>&1 || return 0
+  for f in "${IMMUTABLE_FILES[@]}"; do
+    [[ -e "$f" ]] || continue
+    chattr +i "$f" >/dev/null 2>&1 || true
   done
-  FAILED=("${kept[@]+"${kept[@]}"}")
+  CHATTR_LIFTED=0
 }
 
-ask_retry() {
-  local user="$1" ans
-  printf 'Retry %s? [y/N] ' "$(pair "$user")" >/dev/tty
-  IFS= read -r ans </dev/tty
-  [[ "$ans" == "y" || "$ans" == "Y" ]]
+lift_immutable() {
+  local f
+  if ! command -v chattr >/dev/null 2>&1; then
+    fail "chattr is missing; trying chpasswd anyway"
+    return
+  fi
+  for f in "${IMMUTABLE_FILES[@]}"; do
+    if [[ ! -e "$f" ]]; then
+      skip "chattr -i $f (absent)"
+      continue
+    fi
+    if chattr -i "$f"; then
+      ok "chattr -i $f"
+      CHATTR_LIFTED=1
+    else
+      fail "chattr -i $f"
+    fi
+  done
 }
 
-try_set_password() {
+read_password_pair() {
   local user="$1"
-  local pass=""
+  pass1=""
+  pass2=""
   tty_say ""
-  tty_say "$(pair "$user") — paste password, then press Enter"
-  IFS= read -r -s pass </dev/tty
+  tty_say "$user"
+  printf 'Password: ' >/dev/tty
+  IFS= read -r -s pass1 </dev/tty || true
   printf '\n' >/dev/tty
-  if [[ -z "${pass:-}" ]]; then
-    unset pass
-    return 1
-  fi
-  if printf '%s:%s\n' "$user" "$pass" | chpasswd; then
-    unset pass
-    return 0
-  fi
-  unset pass
-  return 1
+  printf 'Again: ' >/dev/tty
+  IFS= read -r -s pass2 </dev/tty || true
+  printf '\n' >/dev/tty
 }
 
 set_user_password() {
   local user="$1"
   if is_protected "$user"; then
-    mark_skipped "$user"
+    skip "$user is never changed"
     return
   fi
   if ! id "$user" >/dev/null 2>&1; then
-    mark_skipped "$user"
+    skip "$user is not on this box"
     return
   fi
-  while true; do
-    if try_set_password "$user"; then
-      remove_from_failed "$user"
-      mark_changed "$user"
-      return
-    fi
-    mark_failed "$user"
-    if ! ask_retry "$user"; then
-      return
-    fi
-    remove_from_failed "$user"
-  done
+  read_password_pair "$user"
+  if [[ -z "${pass1:-}" ]]; then
+    fail "$user empty password; not changed"
+    unset pass1 pass2
+    return
+  fi
+  if [[ "$pass1" != "$pass2" ]]; then
+    fail "$user pastes did not match; not changed"
+    unset pass1 pass2
+    return
+  fi
+  if printf '%s:%s\n' "$user" "$pass1" | chpasswd; then
+    ok "$user"
+  else
+    fail "$user chpasswd failed"
+  fi
+  unset pass1 pass2
 }
 
-print_names() {
-  local title="$1"
-  shift
-  printf '%s\n' "$title"
-  if [[ "$#" -eq 0 ]]; then
-    printf '  (none)\n'
-    return
-  fi
-  local n
-  for n in "$@"; do
-    printf '  %s\n' "$n"
-  done
+on_exit() {
+  restore_immutable
+  unset pass1 pass2
 }
 
 main() {
   if [[ "$(id -u)" -ne 0 ]]; then
-    printf 'FAILED must be run as root. Use:\n  sudo bash change_passwords.sh\n'
+    printf 'FAIL must be run as root. Use:\n  sudo bash change_passwords.sh\n'
     exit 1
   fi
   if [[ ! -r /dev/tty ]]; then
-    printf 'FAILED this script needs a terminal so passwords are not logged. Run it from a shell, not a pipe.\n'
+    printf 'FAIL this script needs a terminal so passwords are not logged. Run it from a shell, not a pipe.\n'
     exit 1
   fi
 
   mkdir -p /var/log
-  touch "$LOG"
-  chmod 600 "$LOG"
+  touch "$LOG" "$COUNT_FILE"
+  chmod 600 "$LOG" "$COUNT_FILE"
   exec > >(tee -a "$LOG") 2>&1
 
-  local targets=("${NIGEL_USERS[@]}" "${OS_USERS[@]}")
-  if [[ -e "$EXTRAS_FLAG" ]]; then
-    targets+=("${EXTRA_USERS[@]}")
-    log_line "extras enabled on $HOST ($EXTRAS_FLAG)"
-  else
-    log_line "extras not enabled on $HOST (create $EXTRAS_FLAG to rotate blueteam score1 score2 patch)"
-  fi
+  trap on_exit EXIT INT TERM
 
-  tty_say "Host: $HOST"
-  tty_say "Paste a different password for each account. One paste, then Enter. Nothing is saved."
-  tty_say "blackteam and whiteteam are never changed."
-  tty_say "Ctrl+C stops immediately."
+  ok "log $LOG"
+  case "${LANG:-}${LC_ALL:-}" in
+    *UTF-8*|*utf8*) ok "locale is UTF-8" ;;
+    *) warn "locale is not UTF-8; a Cyrillic paste may be mangled" ;;
+  esac
+
+  tty_say "This box will get a NEW password for each of these accounts."
+  tty_say "Paste a different password twice for each name. Nothing is printed or saved."
+  tty_say "blackteam, whiteteam, and root are never changed."
   tty_say "Then update https://dash.playtcdc.org/team/passwords for scoring OS users."
 
+  lift_immutable
+
   local user
-  for user in "${targets[@]}"; do
+  for user in "${NIGEL_USERS[@]}" "${OS_USERS[@]}"; do
     set_user_password "$user"
   done
 
-  printf '\n--- Summary ---\n'
-  print_names "CHANGED" "${CHANGED[@]+"${CHANGED[@]}"}"
-  print_names "FAILED" "${FAILED[@]+"${FAILED[@]}"}"
-  print_names "SKIPPED" "${SKIPPED[@]+"${SKIPPED[@]}"}"
-  printf 'Update https://dash.playtcdc.org/team/passwords for every scoring OS user you changed, or uptime checks fail.\n'
+  restore_immutable
+  ok "put the immutable bit back on passwd and shadow"
 
-  if [[ "${#FAILED[@]}" -gt 0 ]]; then
-    printf 'Unresolved on this host:\n'
-    for user in "${FAILED[@]}"; do
-      printf '  %s\n' "$(pair "$user")"
-    done
-    exit 1
-  fi
+  printf '\n--- Summary ---\n'
+  printf 'OK count %s\n' "$(count_of OK)"
+  printf 'WARN count %s\n' "$(count_of WARN)"
+  printf 'FAIL count %s\n' "$(count_of FAIL)"
+  printf 'SKIP count %s\n' "$(count_of SKIP)"
+  printf 'Update https://dash.playtcdc.org/team/passwords for every scoring OS user you changed, or uptime checks fail.\n'
 }
 
 main "$@"

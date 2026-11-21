@@ -1,16 +1,19 @@
 #!/bin/bash
 # Local Ubuntu 26.04 setup for one box. Run as root:
 #   sudo bash ubuntu_setup.sh
+#   sudo bash ubuntu_setup.sh --accounts-only  (passwords and Nigel provisioning)
 # Calls apt only to install fail2ban when that package is missing.
 # Does not store passwords. Test on a non-competition VM first.
 
+set +x
 set -uo pipefail
 
-SCORING_USERS=(
+PACKET_USERS=(
   washington kennedy teddy lincoln ross streep franklin parks
   armstrong hamilton mlk tubman manziel deniro bush
-  blueteam score1 score2 patch
 )
+EXTRA_USERS=(blueteam score1 score2 patch)
+SCORING_USERS=("${PACKET_USERS[@]}" "${EXTRA_USERS[@]}")
 NEVER_DISABLE=(blackteam whiteteam nigel1 nigel2 nigel3 nigel4 nigel5)
 NIGEL_USERS=(nigel1 nigel2 nigel3 nigel4 nigel5)
 KEEP_USERS=("${SCORING_USERS[@]}" "${NEVER_DISABLE[@]}")
@@ -18,11 +21,8 @@ KEEP_USERS=("${SCORING_USERS[@]}" "${NEVER_DISABLE[@]}")
 NORMAL_PATHS="/usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin"
 RESPAWN_LINE="* * * * * pgrep -af '[s]shd -f /etc/ssh/sshd_config_2222' >/dev/null || /usr/sbin/sshd -f /etc/ssh/sshd_config_2222"
 
+ACCOUNT_FILES=(/etc/passwd /etc/shadow /etc/group /etc/gshadow)
 IMMUTABLE_FILES=(
-  /etc/passwd
-  /etc/shadow
-  /etc/group
-  /etc/gshadow
   /etc/sudoers
   /etc/crontab
   /etc/cron.allow
@@ -168,7 +168,7 @@ section_identity() {
   if command -v chattr >/dev/null 2>&1; then
     HAVE_CHATTR=1
     local f
-    for f in "${IMMUTABLE_FILES[@]}"; do
+    for f in "${ACCOUNT_FILES[@]}" "${IMMUTABLE_FILES[@]}"; do
       if [[ ! -e "$f" ]]; then
         skip "chattr -i $f (absent)"
         continue
@@ -646,68 +646,68 @@ section_sudoers() {
   done
 }
 
-# --- 5. Nigel users ----------------------------------------------------------
+# --- 5. Local competition passwords ------------------------------------------
 
-gen_pass() {
-  python3 - <<'PY'
-import secrets
-alphabet = "абвгдежзийклмнопрстуфхцчшщъыьэюя0123456789"
-print("".join(secrets.choice(alphabet) for _ in range(16)))
-PY
-}
-
-section_nigel() {
-  local ans="n" user pass
-  if [[ ! -r /dev/tty ]]; then
-    skip "nigel password prompt (no terminal)"
-    return
-  fi
-  printf 'Create or refresh nigel1 through nigel5 with new passwords? [y/N] ' >/dev/tty
-  IFS= read -r ans </dev/tty || ans="n"
-  if [[ "$ans" != "y" ]]; then
-    skip "nigel password refresh"
-    return
-  fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    fail "python3 missing; nigel passwords not generated"
-    return
-  fi
-  if ! getent group sudo >/dev/null; then
-    fail "sudo group missing; nigel users not modified"
-    return
-  fi
-  for user in "${NIGEL_USERS[@]}"; do
-    if id "$user" >/dev/null 2>&1; then
-      usermod -s /bin/bash "$user"
-      ok "shell /bin/bash for existing $user"
-    else
-      if useradd -m -s /bin/bash "$user"; then
-        ok "created $user"
-      else
-        fail "useradd $user"
-        continue
-      fi
-    fi
-    pass=$(gen_pass) || true
-    if [[ -z "${pass:-}" ]]; then
-      fail "password generation failed for $user"
-      unset pass
-      continue
-    fi
-    printf '%s %s\n' "$user" "$pass" >/dev/tty
-    if printf '%s:%s\n' "$user" "$pass" | chpasswd; then
-      unset pass
-      if usermod -aG sudo "$user"; then
-        ok "password set and sudo granted for $user"
-      else
-        fail "password set for $user but sudo group update failed"
-      fi
-    else
-      unset pass
-      fail "chpasswd failed for $user; other users still continue"
+check_password_files() {
+  local file attributes
+  for file in "$@"; do
+    attributes=$(lsattr -d "$file" 2>/dev/null) || continue
+    if [[ ${attributes%% *} == *i* ]]; then
+      printf 'STOP %s is immutable. From a trusted admin console, review lsattr and clear the old setup flag on this file before retrying.\n' "$file" >&2
+      return 1
     fi
   done
-  printf 'Copy the five passwords from this terminal. They were not written to the log.\n' >/dev/tty
+  return 0
+}
+
+section_passwords() {
+  local user host
+  local targets=("${NIGEL_USERS[@]}" "${PACKET_USERS[@]}")
+  host=$(hostname)
+  if [[ -e /etc/hawk-rotate-extras ]]; then
+    targets+=("${EXTRA_USERS[@]}")
+  fi
+  check_password_files "${ACCOUNT_FILES[@]}" || return 1
+  if ! getent group sudo >/dev/null; then
+    fail "sudo group missing; password setup stopped"
+    return 1
+  fi
+
+  printf 'Keep your admin console open. Enter and confirm the team password for each named account.\n'
+  printf 'Update https://dash.playtcdc.org/team/passwords as each scored credential changes.\n'
+  for user in "${targets[@]}"; do
+    if ! getent -s files passwd "$user" >/dev/null; then
+      if ! in_list "$user" "${NIGEL_USERS[@]}"; then
+        skip "$user (no local account)"
+        continue
+      fi
+      if getent passwd "$user" >/dev/null; then
+        fail "$user exists outside local account files; stopped"
+        return 1
+      fi
+      if ! useradd -m -s /bin/bash "$user"; then
+        fail "could not create $user; stopped"
+        return 1
+      fi
+      ok "created $user"
+    fi
+
+    printf '\nHost %s | account %s\n' "$host" "$user" >&3
+    if ! /usr/bin/passwd "$user" <&3 >&3 2>&3; then
+      fail "password change failed for $host / $user; earlier successful changes still apply"
+      return 1
+    fi
+    ok "CHANGED $host / $user"
+
+    if in_list "$user" "${NIGEL_USERS[@]}"; then
+      if ! usermod -s /bin/bash -aG sudo "$user"; then
+        fail "password changed for $user, but setting its shell and sudo group failed; stopped"
+        return 1
+      fi
+      ok "configured shell and sudo membership for $user"
+    fi
+  done
+  return 0
 }
 
 # --- 6. SSH on 2222 ----------------------------------------------------------
@@ -1167,7 +1167,7 @@ section_summary() {
   printf 'WARN count %s\n' "$(count_of WARN)"
   printf 'FAIL count %s\n' "$(count_of FAIL)"
   printf 'SKIP count %s\n' "$(count_of SKIP)"
-  printf 'A failed section does not stop the rest. Reinstall any package named in a dpkg -V FAIL. If nigel passwords were created, they were printed on the terminal only.\n'
+  printf 'A failed section does not stop the rest. Reinstall any package named in a dpkg -V FAIL. See CHANGED entries for completed password rotations.\n'
 }
 
 main() {
@@ -1175,11 +1175,27 @@ main() {
     printf 'FAIL must be run as root\n'
     exit 1
   fi
+  if (( $# > 1 )) || { (( $# == 1 )) && [[ $1 != --accounts-only ]]; }; then
+    printf 'Usage: sudo bash ubuntu_setup.sh [--accounts-only]\n' >&2
+    return 2
+  fi
+  if ! exec 3<>/dev/tty || [[ ! -t 3 ]]; then
+    printf 'Password rotation needs an interactive terminal.\n' >&2
+    return 1
+  fi
+
   touch "$LOG" "$COUNT_FILE"
   chmod 600 "$LOG" "$COUNT_FILE"
   exec > >(tee -a "$LOG") 2>&1
 
+  if [[ ${1:-} == --accounts-only ]]; then
+    section_passwords || return 1
+    return 0
+  fi
+
   run_section identity section_identity
+  section_passwords || return 1
+  exec 3>&-
   run_section bashrc section_bashrc
   run_section packages section_dpkg_and_path
   run_section crontabs purge_user_crontabs
@@ -1187,7 +1203,6 @@ main() {
   run_section pam section_pam
   run_section systemd section_systemd
   run_section sudoers section_sudoers
-  run_section nigel section_nigel
   run_section ssh-2222 section_sshd_2222
   run_section cron-respawn section_cron_respawn
   run_section lock-users section_lock_users
