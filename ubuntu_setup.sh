@@ -1279,15 +1279,10 @@ section_port22() {
 section_fail2ban() {
   local jail_file="/etc/fail2ban/jail.local" override="/etc/fail2ban/jail.d/zz-hawk-r18.local" bantime
   if ! dpkg-query -W fail2ban >/dev/null 2>&1; then
-    ok "fail2ban is not installed; installing it"
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban; then
-      fail "apt-get install fail2ban failed"
-      return
-    fi
-    ok "installed fail2ban"
-  else
-    ok "fail2ban is already installed"
+    fail "fail2ban is not installed; install it with packages.sh first"
+    return
   fi
+  ok "fail2ban is installed"
 
   systemctl enable fail2ban || fail "could not enable fail2ban; continuing"
   if systemctl start fail2ban; then
