@@ -116,6 +116,8 @@ ufw allow out to 10.112.10.53 port 53 comment "igris_dns"
 echo "    ufw allow out to 10.112.10.53 port 53 (DNS)"
 ufw allow out to 10.112.20.88 port 53 comment "igris_dns"
 echo "    ufw allow out to 10.112.20.88 port 53 (AD DNS)"
+ufw allow out to 10.100.0.11 port 1514 comment "igris_dns"
+echo "    ufw allow out to 10.100.0.11 port 1514 (Wazuh)"
 ufw reload
 echo "[+] UFW enabled: deny inbound (except allowed ports), allow outbound, logging high."
 

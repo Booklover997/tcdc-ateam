@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# packages.sh — Reinstall core packages, deploy compiled coreutils to /binaries,
-#                and prepend /binaries/bin to PATH system-wide.
+# packages.sh — Install core security/admin packages, deploy compiled coreutils
+#                to /binaries, and prepend /binaries/bin to PATH system-wide.
 
 set -uo pipefail
 
@@ -27,41 +27,31 @@ echo -e "${BLU}========================================${RST}"
 
 # --- Step 1: Install required packages ---
 echo ""
-echo -e "${YLW}[1/5] Installing required packages...${RST}"
+echo -e "${YLW}[1/3] Installing required packages...${RST}"
 apt-get update -qq
 
 PACKAGES=(
-    # Logging
-    rsyslog auditd audispd-plugins
-    # Netfilter / firewall
-    libnetfilter-queue-dev nftables iptables-persistent
-    ufw fail2ban
+    # Firewall / intrusion prevention
+    nftables ufw fail2ban
     # Network analysis
-    tcpdump nmap netcat-openbsd
-    net-tools iproute2 dnsutils whois traceroute mtr-tiny
+    tcpdump nmap net-tools iproute2
     # Monitoring
-    iftop nethogs iotop-c htop nload
-    lsof strace ltrace sysstat
-    # Hardening
-    apparmor apparmor-utils apparmor-profiles
-    rkhunter chkrootkit clamav clamav-daemon
-    libpam-pwquality libpam-google-authenticator
-    lynis aide
-    # WAF / web defense
-    libapache2-mod-security2 modsecurity-crs
+    htop lsof strace
+    # Hardening / auditing
+    auditd apparmor apparmor-utils
+    rkhunter lynis
     # Build tools
-    build-essential python3 python3-pip python3-venv python3-dev
+    build-essential
     # Utilities
-    curl wget git tmux screen
-    jq tree unzip zip gzip bzip2 xz-utils
-    openssl ca-certificates gnupg
-    acl attr logrotate
-    psmisc procps coreutils findutils
-    cryptsetup
+    curl git tmux jq unzip
 )
 
-echo -e "  Installing ${#PACKAGES[@]} packages (with dependencies)..."
-apt-get install -y "${PACKAGES[@]}" || true
+echo -e "  Installing ${#PACKAGES[@]} packages individually..."
+for pkg in "${PACKAGES[@]}"; do
+    if ! apt-get install -y "$pkg" &>/dev/null; then
+        echo -e "  ${RED}✗${RST} $pkg (apt-get failed)"
+    fi
+done
 
 echo ""
 echo -e "${YLW}  Verifying installs...${RST}"
@@ -80,22 +70,9 @@ else
     echo -e "${GRN}  All packages installed.${RST}"
 fi
 
-# --- Step 2: Reinstall all currently installed packages ---
+# --- Step 2: Extract compiled coreutils to /binaries ---
 echo ""
-echo -e "${YLW}[2/5] Reinstalling all installed packages...${RST}"
-dpkg --get-selections | awk '$2 == "install" {print $1}' \
-    | xargs apt-get install --reinstall -y -qq 2>&1 | tail -5
-echo -e "${GRN}  Done.${RST}"
-
-# --- Step 3: Reinstall coreutils from apt ---
-echo ""
-echo -e "${YLW}[3/5] Reinstalling coreutils from apt...${RST}"
-apt-get install --reinstall -y coreutils
-echo -e "${GRN}  Done.${RST}"
-
-# --- Step 4: Extract compiled coreutils to /binaries ---
-echo ""
-echo -e "${YLW}[4/5] Deploying compiled coreutils to ${BINARIES_DIR}...${RST}"
+echo -e "${YLW}[2/3] Deploying compiled coreutils to ${BINARIES_DIR}...${RST}"
 
 if [ ! -f "$COREUTILS_TAR" ]; then
     echo -e "${RED}  Error: $COREUTILS_TAR not found${RST}"
@@ -109,9 +86,9 @@ echo -e "  Extracted to ${BINARIES_DIR}/"
 echo -e "  Binaries: $(ls "$BINARIES_DIR/bin/" | wc -l) commands"
 echo -e "${GRN}  Done.${RST}"
 
-# --- Step 5: Add /binaries/bin to system-wide PATH ---
+# --- Step 3: Add /binaries/bin to system-wide PATH ---
 echo ""
-echo -e "${YLW}[5/5] Adding ${BINARIES_DIR}/bin to system-wide PATH...${RST}"
+echo -e "${YLW}[3/3] Adding ${BINARIES_DIR}/bin to system-wide PATH...${RST}"
 
 PATH_LINE='export PATH="/binaries/bin:$PATH"'
 MARKER="# tcdc-ateam: compiled coreutils"
@@ -127,12 +104,27 @@ EOF
     echo -e "  ${GRN}Added to ${BASHRC_DEFAULT}${RST}"
 fi
 
+# Also add to the current user's ~/.bashrc
+CALLER_HOME=$(eval echo "~${SUDO_USER:-$USER}")
+CALLER_BASHRC="$CALLER_HOME/.bashrc"
+
+if grep -qF "$MARKER" "$CALLER_BASHRC" 2>/dev/null; then
+    echo -e "  ${GRN}Already present in ${CALLER_BASHRC}, skipping.${RST}"
+else
+    cat >> "$CALLER_BASHRC" <<EOF
+
+${MARKER}
+${PATH_LINE}
+EOF
+    echo -e "  ${GRN}Added to ${CALLER_BASHRC}${RST}"
+fi
+
 echo ""
 echo -e "${BLU}========================================${RST}"
 echo -e "${GRN}  Complete.${RST}"
 echo -e "  Compiled coreutils: ${BINARIES_DIR}/bin/"
-echo -e "  PATH updated in:    ${BASHRC_DEFAULT}"
+echo -e "  PATH updated in:    ${BASHRC_DEFAULT} + ${CALLER_BASHRC}"
 echo -e "  New shells will use ${BINARIES_DIR}/bin/ first."
-echo -e "  To use now:  ${YLW}source ${BASHRC_DEFAULT}${RST}"
+echo -e "  To use now:  ${YLW}source ${CALLER_BASHRC}${RST}"
 echo -e "${BLU}========================================${RST}"
 
