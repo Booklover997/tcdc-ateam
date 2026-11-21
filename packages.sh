@@ -32,23 +32,23 @@ apt-get update -qq
 
 PACKAGES=(
     # Logging
-    rsyslog auditd audispd-plugins syslog-ng
+    rsyslog auditd audispd-plugins
     # Netfilter / firewall
-    libnetfilter-queue-dev python3-nfqueue nftables iptables-persistent
+    libnetfilter-queue-dev nftables iptables-persistent
     ufw fail2ban
     # Network analysis
-    tcpdump wireshark-common tshark nmap netcat-openbsd
+    tcpdump nmap netcat-openbsd
     net-tools iproute2 dnsutils whois traceroute mtr-tiny
     # Monitoring
-    iftop nethogs iotop-c htop bmon nload
+    iftop nethogs iotop-c htop nload
     lsof strace ltrace sysstat
     # Hardening
-    apparmor apparmor-utils apparmor-profiles apparmor-profiles-extra
-    aide rkhunter chkrootkit clamav clamav-daemon
+    apparmor apparmor-utils apparmor-profiles
+    rkhunter chkrootkit clamav clamav-daemon
     libpam-pwquality libpam-google-authenticator
-    lynis
-    # Services
-    openssh-server nginx apache2
+    lynis aide
+    # WAF / web defense
+    libnginx-mod-http-naxsi libapache2-mod-security2 modsecurity-crs
     # Build tools
     build-essential python3 python3-pip python3-venv python3-dev
     # Utilities
@@ -60,15 +60,25 @@ PACKAGES=(
     cryptsetup
 )
 
+echo -e "  Installing ${#PACKAGES[@]} packages (with dependencies)..."
+apt-get install -y "${PACKAGES[@]}"
+
+echo ""
+echo -e "${YLW}  Verifying installs...${RST}"
+FAILED=0
 for pkg in "${PACKAGES[@]}"; do
-    [[ "$pkg" == \#* ]] && continue
-    if apt-get install -y -qq "$pkg" 2>/dev/null; then
+    if dpkg -s "$pkg" &>/dev/null; then
         echo -e "  ${GRN}✓${RST} $pkg"
     else
-        echo -e "  ${RED}✗${RST} $pkg (not available, skipped)"
+        echo -e "  ${RED}✗${RST} $pkg (FAILED)"
+        FAILED=$((FAILED + 1))
     fi
 done
-echo -e "${GRN}  Done.${RST}"
+if [ $FAILED -gt 0 ]; then
+    echo -e "  ${RED}$FAILED package(s) failed to install${RST}"
+else
+    echo -e "${GRN}  All packages installed.${RST}"
+fi
 
 # --- Step 2: Reinstall all currently installed packages ---
 echo ""
@@ -125,4 +135,5 @@ echo -e "  PATH updated in:    ${BASHRC_DEFAULT}"
 echo -e "  New shells will use ${BINARIES_DIR}/bin/ first."
 echo -e "  To use now:  ${YLW}source ${BASHRC_DEFAULT}${RST}"
 echo -e "${BLU}========================================${RST}"
+
 
