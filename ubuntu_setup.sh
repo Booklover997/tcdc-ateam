@@ -115,7 +115,11 @@ restore_file() {
 run_section() {
   local name="$1"
   shift
-  local rc
+  local rc started
+  started=$(date '+%H:%M:%S')
+  printf '\n============================================================\n'
+  printf 'START [%s] %s\n' "$started" "$name"
+  printf '============================================================\n'
   set +e
   (
     set -uo pipefail
@@ -125,7 +129,21 @@ run_section() {
   set +e
   if [[ "$rc" -ne 0 ]]; then
     fail "section ${name} aborted with status ${rc}; the next section still runs"
+    printf 'END   [%s] %s completed with errors\n' "$(date '+%H:%M:%S')" "$name"
+  else
+    printf 'END   [%s] %s completed\n' "$(date '+%H:%M:%S')" "$name"
   fi
+}
+
+show_plan() {
+  printf '\nTCDC Ubuntu setup plan for %s\n' "$(hostname)"
+  printf 'Mode: %s\n' "$1"
+  printf 'Log: %s\n' "$LOG"
+  printf 'Backup directory: %s\n' "$BACKUP"
+  printf 'Passwords are entered at hidden terminal prompts and are not printed to this log.\n'
+  printf 'The PAM step only reports suspicious entries. It does not edit PAM configuration.\n'
+  printf 'Root will be disabled only after Nigel accounts have passwords and sudo access.\n'
+  printf '\n'
 }
 
 path_is_normal() {
@@ -152,6 +170,8 @@ curl_pipe_shell() {
 # --- 1. Identity and lift immutable bits ------------------------------------
 
 section_identity() {
+  printf 'Identify this host and create a protected backup directory.\n'
+  printf 'Remove old immutable flags from account, sudo, SSH, and cron files so setup can manage them.\n'
   ok "hostname $(hostname)"
   ok "date $(date)"
   if [[ -r /etc/os-release ]]; then
@@ -503,9 +523,6 @@ pam_line_is_backdoor() {
   [[ -z "$line" ]] && return 1
   [[ "$line" == *pam_exec* || "$line" == *pam_python* ]] && return 0
   [[ "$line" == *'/tmp'* || "$line" == *'/dev/shm'* || "$line" == *'/var/tmp'* || "$line" == *'/home/'* || "$line" == *'/root/'* ]] && return 0
-  if [[ "$line" == auth* && "$line" == *pam_permit.so* ]]; then
-    return 0
-  fi
   # Without a working package database, unknown-module checks would delete the stock stack.
   dpkg -S pam_unix.so >/dev/null 2>&1 || return 1
   token=$(printf '%s\n' "$line" | awk '{for (i = 1; i <= NF; i++) if ($i ~ /\.so/) {print $i; exit}}')
@@ -517,66 +534,31 @@ pam_line_is_backdoor() {
   return 0
 }
 
-pam_file_safe() {
-  local f="$1" base
-  [[ -s "$f" ]] || return 1
-  base=$(basename -- "$f")
-  case "$base" in
-    sshd|login|common-auth|su|sudo)
-      grep -q pam_unix "$f" || return 1
-      ;;
-  esac
-  return 0
-}
-
 clean_pam_file() {
-  local f="$1" line tmp changed=0
+  local f="$1" line number=0
   [[ -f "$f" ]] || return 0
-  hands_off_path "$f" && { skip "pam $f"; return; }
-  tmp=$(mktemp)
   while IFS= read -r line || [[ -n "$line" ]]; do
+    number=$((number + 1))
     if pam_line_is_backdoor "$line"; then
-      fail "removed PAM line from $f: $line"
-      changed=1
-      continue
+      warn "PAM review needed at $f:$number: $line"
     fi
-    if [[ "$line" == *pam_unix* && "$line" == *nullok* ]]; then
-      line=${line//nullok_secure/}
-      line=${line//nullok/}
-      fail "stripped nullok in $f"
-      changed=1
-    fi
-    printf '%s\n' "$line" >>"$tmp"
   done <"$f"
-  if [[ "$changed" -eq 1 ]]; then
-    backup_file "$f"
-    if cat "$tmp" >"$f" && pam_file_safe "$f"; then
-      ok "rewrote $f"
-    else
-      fail "PAM rewrite of $f looked unsafe"
-      restore_file "$f" || true
-    fi
-  else
-    ok "pam clean $f"
-  fi
-  rm -f "$tmp"
+  return 0
 }
 
 section_pam() {
   local f
+  printf 'Read PAM policy files and report suspicious module names or writable paths.\n'
+  printf 'No PAM file is opened for writing, replaced, or deleted by this audit.\n'
+  ok "PAM audit only; no PAM files will be changed"
   if [[ -d /etc/pam.d ]]; then
     for f in /etc/pam.d/*; do
       [[ -f "$f" ]] || continue
       clean_pam_file "$f"
     done
   fi
-  clean_pam_file /etc/pam.conf
-
   if [[ -s /etc/ld.so.preload ]]; then
-    fail "/etc/ld.so.preload was non-empty"
-    backup_file /etc/ld.so.preload
-    : > /etc/ld.so.preload
-    ok "truncated /etc/ld.so.preload"
+    warn "/etc/ld.so.preload is non-empty; review its contents"
   else
     ok "/etc/ld.so.preload empty or absent"
   fi
@@ -708,8 +690,12 @@ section_passwords() {
     return 1
   fi
 
-  printf 'Keep your admin console open. Use one password for Nigel and a separate password for each scored account.\n'
-  printf 'Update https://dash.playtcdc.org/team/passwords as each scored credential changes.\n'
+  printf 'Account password stage for host %s\n' "$host"
+  printf 'Nigel accounts share one password. Enter it once at the hidden prompt.\n'
+  printf 'Each present scored account gets its own password prompt.\n'
+  printf 'Missing Nigel accounts are created before their shared password is set.\n'
+  printf 'Keep this terminal open. If a password update fails, setup stops before later hardening.\n'
+  printf 'Update https://dash.playtcdc.org/team/passwords for every scored account you change.\n'
   for user in "${NIGEL_USERS[@]}"; do
     if getent -s files passwd "$user" >/dev/null; then
       continue
@@ -838,10 +824,13 @@ section_cron_respawn() {
 
 section_disable_root() {
   local name x uid field ready=1 user
-  visudo -c || return 1
+  printf 'Root access stage: first verify sudoers and every Nigel account.\n'
+  printf 'Root password lock and SSH restrictions are applied only after those checks pass.\n'
+  visudo -c || { fail 'sudoers validation failed; root remains enabled'; return 1; }
   for user in "${NIGEL_USERS[@]}"; do
     if ! id "$user" >/dev/null 2>&1; then
       ready=0
+      printf 'Cannot disable root: %s is missing or does not have a usable password and sudo rights.\n' "$user" >&2
       break
     fi
     field=$(awk -F: -v u="$user" '$1 == u { print $2 }' /etc/shadow)
@@ -861,12 +850,17 @@ section_disable_root() {
     fail "nigel accounts are not all able to log in; root password left unchanged"
   fi
   [[ "$ready" -eq 1 ]] || return 1
-  [[ $(passwd -S root | awk '{print $2}') == L ]] || return 1
+  if [[ $(passwd -S root | awk '{print $2}') != L ]]; then
+    fail 'root password lock could not be verified'
+    return 1
+  fi
+  printf 'Root password lock verified. Now setting PermitRootLogin no on SSH configs.\n'
   disable_root_ssh || return 1
 }
 
 disable_root_ssh() {
   local config tmp policy pid command
+  printf 'Checking SSH configuration before and after each root-login restriction.\n'
   for config in /etc/ssh/sshd_config /etc/ssh/sshd_config_2222; do
     if [[ ! -f "$config" ]]; then
       [[ "$config" == /etc/ssh/sshd_config_2222 ]] && continue
@@ -912,11 +906,14 @@ disable_root_ssh() {
       return 1
     fi
   fi
+  printf 'Root cannot authenticate over the configured SSH listeners.\n'
 }
 
 section_lock_users() {
   local name x uid shell
 
+  printf 'Lock unexpected local accounts and set their shells to nologin.\n'
+  printf 'Packet scoring users, Nigel users, blackteam, and whiteteam are preserved.\n'
   while IFS=: read -r name x uid x x x shell; do
     [[ "$uid" =~ ^[0-9]+$ ]] || continue
     [[ "$uid" -ge 1000 ]] || continue
@@ -1267,6 +1264,7 @@ section_summary() {
   printf 'FAIL count %s\n' "$(count_of FAIL)"
   printf 'SKIP count %s\n' "$(count_of SKIP)"
   printf 'A failed section does not stop the rest. Reinstall any package named in a dpkg -V FAIL. See CHANGED entries for completed password rotations.\n'
+  printf 'Read the log above for each START/END block, every OK/WARN/FAIL/SKIP record, and any manual review item.\n'
 }
 
 main() {
@@ -1288,22 +1286,30 @@ main() {
   exec > >(tee -a "$LOG") 2>&1
 
   if [[ ${1:-} == --accounts-only ]]; then
+    show_plan 'accounts-only'
+    printf 'This mode changes team passwords, audits PAM without editing it, and disables root after checks.\n'
     section_passwords || return 1
+    run_section pam-audit section_pam
     section_disable_root || return 1
+    printf '\nAccounts-only setup completed. Review %s before closing this terminal.\n' "$LOG"
     return 0
   fi
 
+  show_plan 'full setup'
+  printf 'Full mode runs each hardening stage in order. Failed sections are recorded and reported.\n'
   run_section identity section_identity
-  section_passwords || return 1
+  printf '\nPassword rotation runs before hardening. A failure stops setup here.\n'
+  section_passwords || { fail 'password stage failed; later setup stages were not run'; return 1; }
   exec 3>&-
   run_section bashrc section_bashrc
   run_section packages section_dpkg_and_path
   run_section crontabs purge_user_crontabs
   run_section ssh-keys report_or_purge_keys
+  run_section pam-audit section_pam
   run_section systemd section_systemd
   run_section sudoers section_sudoers
   run_section ssh-2222 section_sshd_2222
-  section_disable_root || return 1
+  section_disable_root || { fail 'root-disable checks failed; later hardening stages were not run'; return 1; }
   run_section cron-respawn section_cron_respawn
   run_section lock-users section_lock_users
   run_section aliases section_aliases
