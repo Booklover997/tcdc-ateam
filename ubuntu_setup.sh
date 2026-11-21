@@ -660,9 +660,44 @@ check_password_files() {
   return 0
 }
 
+# Keep the shared secret in this short-lived shell. Only chpasswd's stdin receives it.
+rotate_nigel_passwords() (
+  set +x
+  set +a
+  unset nigel_password
+  local host="$1" nigel_password user changed=0 failed=0
+  shift
+  ulimit -c 0 || return 1
+
+  nigel_tty_state=$(stty -g <&3) || return 1
+  trap 'stty "$nigel_tty_state" <&3' EXIT
+  trap 'exit 1' HUP INT TERM
+  stty -echo <&3 || return 1
+  printf 'Host %s | Shared password for %s (paste once): ' "$host" "$*" >&3
+  if ! IFS= read -r -s nigel_password <&3 || [[ -z "$nigel_password" ]]; then
+    printf '\nStopped before changing any Nigel password.\n' >&3
+    return 1
+  fi
+  stty "$nigel_tty_state" <&3 || return 1
+  trap - EXIT
+  printf '\n' >&3
+  for user in "$@"; do
+    if builtin printf '%s:%s\n' "$user" "$nigel_password" | /usr/sbin/chpasswd; then
+      printf 'CHANGED %s / %s\n' "$host" "$user"
+      changed=$((changed + 1))
+    else
+      printf 'FAILED %s / %s\n' "$host" "$user"
+      failed=$((failed + 1))
+    fi
+  done
+  unset nigel_password
+  printf 'Nigel accounts changed: %s of %s. Failed: %s.\n' "$changed" "$#" "$failed"
+  [[ "$failed" == 0 ]]
+)
+
 section_passwords() {
   local user host
-  local targets=("${NIGEL_USERS[@]}" "${PACKET_USERS[@]}")
+  local targets=("${PACKET_USERS[@]}")
   host=$(hostname)
   if [[ -e /etc/hawk-rotate-extras ]]; then
     targets+=("${EXTRA_USERS[@]}")
@@ -673,39 +708,46 @@ section_passwords() {
     return 1
   fi
 
-  printf 'Keep your admin console open. Enter and confirm the team password for each named account.\n'
+  printf 'Keep your admin console open. Use one password for Nigel and a separate password for each scored account.\n'
   printf 'Update https://dash.playtcdc.org/team/passwords as each scored credential changes.\n'
+  for user in "${NIGEL_USERS[@]}"; do
+    if getent -s files passwd "$user" >/dev/null; then
+      continue
+    fi
+    if getent passwd "$user" >/dev/null; then
+      fail "$user exists outside local account files; stopped"
+      return 1
+    fi
+    if ! useradd -m -s /bin/bash "$user"; then
+      fail "could not create $user; stopped"
+      return 1
+    fi
+    ok "created $user"
+  done
+
+  if ! rotate_nigel_passwords "$host" "${NIGEL_USERS[@]}"; then
+    fail "Nigel rotation incomplete; check CHANGED and FAILED entries before retrying"
+    return 1
+  fi
+  for user in "${NIGEL_USERS[@]}"; do
+    if ! usermod -s /bin/bash -aG sudo "$user"; then
+      fail "password changed for $user, but setting its shell and sudo group failed; stopped"
+      return 1
+    fi
+    ok "configured shell and sudo membership for $user"
+  done
+
   for user in "${targets[@]}"; do
     if ! getent -s files passwd "$user" >/dev/null; then
-      if ! in_list "$user" "${NIGEL_USERS[@]}"; then
-        skip "$user (no local account)"
-        continue
-      fi
-      if getent passwd "$user" >/dev/null; then
-        fail "$user exists outside local account files; stopped"
-        return 1
-      fi
-      if ! useradd -m -s /bin/bash "$user"; then
-        fail "could not create $user; stopped"
-        return 1
-      fi
-      ok "created $user"
+      skip "$user (no local account)"
+      continue
     fi
-
     printf '\nHost %s | account %s\n' "$host" "$user" >&3
     if ! /usr/bin/passwd "$user" <&3 >&3 2>&3; then
       fail "password change failed for $host / $user; earlier successful changes still apply"
       return 1
     fi
     ok "CHANGED $host / $user"
-
-    if in_list "$user" "${NIGEL_USERS[@]}"; then
-      if ! usermod -s /bin/bash -aG sudo "$user"; then
-        fail "password changed for $user, but setting its shell and sudo group failed; stopped"
-        return 1
-      fi
-      ok "configured shell and sudo membership for $user"
-    fi
   done
   return 0
 }
@@ -794,15 +836,17 @@ section_cron_respawn() {
 
 # --- 8. Lock root and unexpected users ---------------------------------------
 
-section_lock_users() {
+section_disable_root() {
   local name x uid field ready=1 user
+  visudo -c || return 1
   for user in "${NIGEL_USERS[@]}"; do
     if ! id "$user" >/dev/null 2>&1; then
       ready=0
       break
     fi
     field=$(awk -F: -v u="$user" '$1 == u { print $2 }' /etc/shadow)
-    if [[ -z "$field" || "$field" == '!'* || "$field" == '*' ]]; then
+    if [[ -z "$field" || "$field" == '!'* || "$field" == '*'* ]] ||
+       ! sudo -n -l -U "$user" /usr/bin/id -u >/dev/null 2>&1; then
       ready=0
       break
     fi
@@ -816,7 +860,62 @@ section_lock_users() {
   else
     fail "nigel accounts are not all able to log in; root password left unchanged"
   fi
-  skip "root shell unchanged; root processes not killed"
+  [[ "$ready" -eq 1 ]] || return 1
+  [[ $(passwd -S root | awk '{print $2}') == L ]] || return 1
+  disable_root_ssh || return 1
+}
+
+disable_root_ssh() {
+  local config tmp policy pid command
+  for config in /etc/ssh/sshd_config /etc/ssh/sshd_config_2222; do
+    if [[ ! -f "$config" ]]; then
+      [[ "$config" == /etc/ssh/sshd_config_2222 ]] && continue
+      fail "missing $config"
+      return 1
+    fi
+    /usr/sbin/sshd -t -f "$config" || return 1
+    tmp=$(mktemp) || return 1
+    cp -p "$config" "$tmp" || { rm -f "$tmp"; return 1; }
+    # Prepend the global restriction before any Include directives.
+    if ! { printf 'PermitRootLogin no\n'; sed '/^PermitRootLogin no$/d' "$tmp"; } >"$config"; then
+      rm -f "$tmp"
+      fail "could not write $config; check immutable flags"
+      return 1
+    fi
+    policy=$(/usr/sbin/sshd -T -f "$config" -C user=root,host=localhost,addr=127.0.0.1) || policy=""
+    if ! /usr/sbin/sshd -t -f "$config" || ! grep -qx 'permitrootlogin no' <<<"$policy"; then
+      cat "$tmp" >"$config"
+      rm -f "$tmp"
+      fail "root SSH restriction rejected for $config; review Match rules"
+      return 1
+    fi
+    mkdir -p "${BACKUP}/root-login"
+    chmod 700 "$BACKUP" "${BACKUP}/root-login"
+    mv "$tmp" "${BACKUP}/root-login/$(basename "$config").before"
+    ok "root SSH login disabled in $config"
+  done
+  if systemctl is-active --quiet ssh; then
+    systemctl reload ssh || return 1
+  elif systemctl is-active --quiet sshd; then
+    systemctl reload sshd || return 1
+  else
+    warn "SSH service inactive; root restriction applies when it starts"
+  fi
+  if [[ -f /run/sshd-2222.pid ]]; then
+    read -r pid </run/sshd-2222.pid
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 1
+    command=$(ps -p "$pid" -o args= || true)
+    if [[ "$command" == *sshd* && "$command" == *'-f /etc/ssh/sshd_config_2222'* ]]; then
+      kill -HUP "$pid" || return 1
+    else
+      fail "could not verify port 2222 listener PID for reload"
+      return 1
+    fi
+  fi
+}
+
+section_lock_users() {
+  local name x uid shell
 
   while IFS=: read -r name x uid x x x shell; do
     [[ "$uid" =~ ^[0-9]+$ ]] || continue
@@ -1190,6 +1289,7 @@ main() {
 
   if [[ ${1:-} == --accounts-only ]]; then
     section_passwords || return 1
+    section_disable_root || return 1
     return 0
   fi
 
@@ -1200,10 +1300,10 @@ main() {
   run_section packages section_dpkg_and_path
   run_section crontabs purge_user_crontabs
   run_section ssh-keys report_or_purge_keys
-  run_section pam section_pam
   run_section systemd section_systemd
   run_section sudoers section_sudoers
   run_section ssh-2222 section_sshd_2222
+  section_disable_root || return 1
   run_section cron-respawn section_cron_respawn
   run_section lock-users section_lock_users
   run_section aliases section_aliases
