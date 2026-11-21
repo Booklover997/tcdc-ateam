@@ -2,6 +2,7 @@
 # Local Ubuntu 26.04 setup for one box. Run as root:
 #   sudo bash ubuntu_setup.sh
 #   sudo bash ubuntu_setup.sh --accounts-only  (passwords and Nigel provisioning)
+#   sudo bash ubuntu_setup.sh --ssh            (skip locking OS/system users)
 # Calls apt only to install fail2ban when that package is missing.
 # Does not store passwords. Test on a non-competition VM first.
 
@@ -17,6 +18,8 @@ SCORING_USERS=("${PACKET_USERS[@]}" "${EXTRA_USERS[@]}")
 NEVER_DISABLE=(blackteam whiteteam nigel1 nigel2 nigel3 nigel4 nigel5)
 NIGEL_USERS=(nigel1 nigel2 nigel3 nigel4 nigel5)
 KEEP_USERS=("${SCORING_USERS[@]}" "${NEVER_DISABLE[@]}")
+LOCK_EXEMPT=(blackteam whiteteam nigel1 nigel2 nigel3 nigel4 nigel5)
+SSH_MODE=0
 
 NORMAL_PATHS="/usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin"
 RESPAWN_LINE="* * * * * pgrep -af '[s]shd -f /etc/ssh/sshd_config_2222' >/dev/null || /usr/sbin/sshd -f /etc/ssh/sshd_config_2222"
@@ -464,50 +467,110 @@ purge_cron_dirs() {
   strip_bad_lines_in_file /etc/crontab
 }
 
+filter_user_crontab() {
+  local user="$1" line tmp kept=0
+  tmp=$(mktemp)
+  if ! crontab -l -u "$user" >"${tmp}.in" 2>/dev/null; then
+    rm -f "$tmp" "${tmp}.in"
+    return
+  fi
+  save_user_crontab "$user"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*# || -z "$line" ]]; then
+      printf '%s\n' "$line" >>"$tmp"
+      continue
+    fi
+    if [[ "$line" == *wazuh* || "$line" == *ossec* || "$line" == *auditd* ]]; then
+      printf '%s\n' "$line" >>"$tmp"
+      kept=1
+      continue
+    fi
+    if bad_exec_path "$line" || curl_pipe_shell "$line"; then
+      fail "removed cron line for $user: $line"
+      continue
+    fi
+    printf '%s\n' "$line" >>"$tmp"
+    kept=1
+  done <"${tmp}.in"
+  if [[ "$kept" -eq 0 ]]; then
+    crontab -r -u "$user" 2>/dev/null || true
+    ok "purged crontab for $user (all lines suspicious)"
+  elif crontab -u "$user" "$tmp"; then
+    ok "filtered crontab for $user"
+  else
+    fail "crontab install failed for $user"
+  fi
+  rm -f "$tmp" "${tmp}.in"
+}
+
 purge_user_crontabs() {
   local name x uid
   while IFS=: read -r name x uid x x x x; do
     [[ "$uid" =~ ^[0-9]+$ ]] || continue
-    [[ "$uid" -ge 1000 ]] || continue
-    if is_keep_user "$name"; then
-      skip "crontab $name"
-      continue
-    fi
+    [[ "$name" == root ]] && continue
+    in_list "$name" "${LOCK_EXEMPT[@]}" && { skip "crontab $name"; continue; }
     if save_user_crontab "$name"; then
-      crontab -r -u "$name" 2>/dev/null || true
-      ok "removed crontab for $name"
+      if is_scoring_user "$name"; then
+        filter_user_crontab "$name"
+      else
+        crontab -r -u "$name" 2>/dev/null || true
+        ok "removed crontab for $name"
+      fi
     fi
   done < /etc/passwd
   filter_root_crontab
   purge_cron_dirs
 }
 
-report_or_purge_keys() {
-  local name home f n line uid
-  while IFS=: read -r name x uid x x home x; do
-    [[ "$uid" =~ ^[0-9]+$ ]] || continue
-    [[ -d "$home" ]] || continue
-    if [[ "$name" == root ]]; then
-      :
-    elif [[ "$uid" -lt 1000 ]]; then
-      continue
+purge_ssh_dir() {
+  local home="$1" name="$2" f
+  [[ -d "$home/.ssh" ]] || return 0
+
+  for f in "$home/.ssh/id_rsa_backup" "$home/.ssh/id_dsa_backup" "$home/.ssh/id_ecdsa_backup" "$home/.ssh/id_ed25519_backup"; do
+    if [[ -f "$f" ]]; then
+      backup_file "$f"
+      rm -f "$f"
+      ok "removed fake key $f"
     fi
-    for f in "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2"; do
-      [[ -f "$f" ]] || continue
-      n=$(grep -cve '^[[:space:]]*$' "$f" || true)
-      if [[ "$name" == blackteam || "$name" == whiteteam ]] || is_scoring_user "$name"; then
-        warn "keeping $f ($n key lines)"
-        while IFS= read -r line || [[ -n "$line" ]]; do
-          [[ "$line" =~ ^[[:space:]]*# || -z "$line" ]] && continue
-          warn "key comment $f ${line##* }"
-        done <"$f"
-        continue
-      fi
+  done
+
+  if [[ "$name" == blackteam || "$name" == whiteteam ]]; then
+    warn "keeping $home/.ssh/authorized_keys (${name})"
+    return 0
+  fi
+
+  for f in "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2"; do
+    if [[ -f "$f" ]]; then
       backup_file "$f"
       rm -f "$f"
       ok "removed $f"
-    done
+    fi
+  done
+}
+
+report_or_purge_keys() {
+  local name home f line uid
+
+  while IFS=: read -r name x uid x x home x; do
+    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    [[ -d "$home" ]] || continue
+    purge_ssh_dir "$home" "$name"
   done < /etc/passwd
+
+  local hidden
+  for hidden in /var/lib/.*; do
+    [[ -d "$hidden/.ssh" ]] || continue
+    [[ "$hidden" == */. || "$hidden" == */.. ]] && continue
+    local hname
+    hname=$(basename "$hidden")
+    warn "hidden home dir with .ssh: $hidden"
+    backup_file "$hidden/.ssh/authorized_keys" 2>/dev/null || true
+    rm -f "$hidden/.ssh/authorized_keys" "$hidden/.ssh/authorized_keys2"
+    ok "removed authorized_keys from $hidden"
+    for f in "$hidden/.ssh/id_rsa_backup" "$hidden/.ssh/id_dsa_backup" "$hidden/.ssh/id_ecdsa_backup" "$hidden/.ssh/id_ed25519_backup"; do
+      [[ -f "$f" ]] && rm -f "$f" && ok "removed $f"
+    done
+  done
 
   if [[ -f /etc/ssh/sshd_config ]]; then
     while IFS= read -r line; do
@@ -651,18 +714,30 @@ rotate_nigel_passwords() (
   shift
   ulimit -c 0 || return 1
 
+  local nigel_confirm
   nigel_tty_state=$(stty -g <&3) || return 1
   trap 'stty "$nigel_tty_state" <&3' EXIT
   trap 'exit 1' HUP INT TERM
   stty -echo <&3 || return 1
-  printf 'Host %s | Shared password for %s (paste once): ' "$host" "$*" >&3
+  printf 'Host %s | Shared password for %s\n' "$host" "$*" >&3
+  printf 'Password: ' >&3
   if ! IFS= read -r -s nigel_password <&3 || [[ -z "$nigel_password" ]]; then
+    printf '\nStopped before changing any Nigel password.\n' >&3
+    return 1
+  fi
+  printf '\nConfirm:  ' >&3
+  if ! IFS= read -r -s nigel_confirm <&3; then
     printf '\nStopped before changing any Nigel password.\n' >&3
     return 1
   fi
   stty "$nigel_tty_state" <&3 || return 1
   trap - EXIT
   printf '\n' >&3
+  if [[ "$nigel_password" != "$nigel_confirm" ]]; then
+    printf 'Passwords do not match; Nigel accounts not changed.\n' >&3
+    return 1
+  fi
+  unset nigel_confirm
   for user in "$@"; do
     if builtin printf '%s:%s\n' "$user" "$nigel_password" | /usr/sbin/chpasswd; then
       printf 'CHANGED %s / %s\n' "$host" "$user"
@@ -691,8 +766,8 @@ section_passwords() {
   fi
 
   printf 'Account password stage for host %s\n' "$host"
-  printf 'Nigel accounts share one password. Enter it once at the hidden prompt.\n'
-  printf 'Each present scored account gets its own password prompt.\n'
+  printf 'Nigel accounts share one password. Scored accounts share a separate one.\n'
+  printf 'Each group gets one hidden prompt.\n'
   printf 'Missing Nigel accounts are created before their shared password is set.\n'
   printf 'Keep this terminal open. If a password update fails, setup stops before later hardening.\n'
   printf 'Update https://dash.playtcdc.org/team/passwords for every scored account you change.\n'
@@ -723,18 +798,56 @@ section_passwords() {
     ok "configured shell and sudo membership for $user"
   done
 
+  local present_targets=()
   for user in "${targets[@]}"; do
-    if ! getent -s files passwd "$user" >/dev/null; then
+    if getent -s files passwd "$user" >/dev/null; then
+      present_targets+=("$user")
+    else
       skip "$user (no local account)"
-      continue
     fi
-    printf '\nHost %s | account %s\n' "$host" "$user" >&3
-    if ! /usr/bin/passwd "$user" <&3 >&3 2>&3; then
-      fail "password change failed for $host / $user; earlier successful changes still apply"
+  done
+
+  if [[ ${#present_targets[@]} -gt 0 ]]; then
+    local scored_password scored_confirm
+    local tty_state
+    tty_state=$(stty -g <&3) || return 1
+
+    printf '\nHost %s | Shared password for scored accounts (%s):\n' "$host" "${present_targets[*]}" >&3
+    stty -echo <&3
+    printf 'Password: ' >&3
+    IFS= read -r -s scored_password <&3 || { stty "$tty_state" <&3; return 1; }
+    printf '\n' >&3
+    printf 'Confirm:  ' >&3
+    IFS= read -r -s scored_confirm <&3 || { stty "$tty_state" <&3; return 1; }
+    printf '\n' >&3
+    stty "$tty_state" <&3
+
+    if [[ -z "$scored_password" ]]; then
+      fail "empty password; scored accounts not changed"
       return 1
     fi
-    ok "CHANGED $host / $user"
-  done
+    if [[ "$scored_password" != "$scored_confirm" ]]; then
+      fail "passwords do not match; scored accounts not changed"
+      return 1
+    fi
+
+    local changed=0 failed_count=0
+    for user in "${present_targets[@]}"; do
+      if builtin printf '%s:%s\n' "$user" "$scored_password" | /usr/sbin/chpasswd; then
+        ok "CHANGED $host / $user"
+        changed=$((changed + 1))
+      else
+        fail "FAILED $host / $user"
+        failed_count=$((failed_count + 1))
+      fi
+    done
+    unset scored_password scored_confirm
+    printf 'Scored accounts changed: %s of %s. Failed: %s.\n' "$changed" "${#present_targets[@]}" "$failed_count"
+    if [[ "$failed_count" -gt 0 ]]; then
+      fail "some scored password changes failed"
+      return 1
+    fi
+  fi
   return 0
 }
 
@@ -910,32 +1023,40 @@ disable_root_ssh() {
 }
 
 section_lock_users() {
-  local name x uid shell
+  local name x uid shell home
+  local -a ESSENTIAL_OS=(root daemon bin sys sync games man lp mail news uucp proxy
+    www-data backup list irc _apt messagebus systemd-network systemd-resolve
+    systemd-timesync syslog uuidd tcpdump sshd)
 
-  printf 'Lock unexpected local accounts and set their shells to nologin.\n'
-  printf 'Packet scoring users, Nigel users, blackteam, and whiteteam are preserved.\n'
-  while IFS=: read -r name x uid x x x shell; do
+  printf 'Lock all accounts except whiteteam, blackteam, and nigel1-5.\n'
+  if [[ "$SSH_MODE" -eq 1 ]]; then
+    printf 'SSH mode: OS/system users (uid < 1000) are skipped.\n'
+  fi
+
+  while IFS=: read -r name x uid x x home shell; do
     [[ "$uid" =~ ^[0-9]+$ ]] || continue
-    [[ "$uid" -ge 1000 ]] || continue
-    [[ "$name" == nobody ]] && continue
-    if is_never_disable "$name"; then
-      skip "lock $name"
-      continue
+
+    in_list "$name" "${LOCK_EXEMPT[@]}" && { skip "lock $name (exempt)"; continue; }
+
+    if [[ "$uid" -lt 1000 ]]; then
+      [[ "$SSH_MODE" -eq 1 ]] && { skip "lock $name (OS user, --ssh mode)"; continue; }
+      [[ "$name" == root ]] && continue
     fi
-    if usermod -L "$name"; then
+
+    if usermod -L "$name" 2>/dev/null; then
       ok "LOCKED: $name"
     else
       fail "usermod -L $name"
     fi
-    if usermod -s /usr/sbin/nologin "$name"; then
-      ok "nologin $name"
-    else
-      fail "usermod -s nologin $name"
+    if [[ "$shell" != "/usr/sbin/nologin" && "$shell" != "/bin/false" ]]; then
+      if usermod -s /usr/sbin/nologin "$name" 2>/dev/null; then
+        ok "nologin $name"
+      else
+        fail "usermod -s nologin $name"
+      fi
     fi
-    if pkill -u "$name" 2>/dev/null; then
-      ok "pkill -u $name"
-    else
-      ok "no processes for $name"
+    if [[ "$uid" -ge 1000 ]]; then
+      pkill -u "$name" 2>/dev/null && ok "pkill -u $name" || ok "no processes for $name"
     fi
   done < /etc/passwd
 }
@@ -1272,10 +1393,14 @@ main() {
     printf 'FAIL must be run as root\n'
     exit 1
   fi
-  if (( $# > 1 )) || { (( $# == 1 )) && [[ $1 != --accounts-only ]]; }; then
-    printf 'Usage: sudo bash ubuntu_setup.sh [--accounts-only]\n' >&2
-    return 2
-  fi
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --accounts-only) ;;
+      --ssh) SSH_MODE=1 ;;
+      *) printf 'Usage: sudo bash ubuntu_setup.sh [--accounts-only] [--ssh]\n' >&2; return 2 ;;
+    esac
+  done
   if ! exec 3<>/dev/tty || [[ ! -t 3 ]]; then
     printf 'Password rotation needs an interactive terminal.\n' >&2
     return 1
@@ -1285,7 +1410,7 @@ main() {
   chmod 600 "$LOG" "$COUNT_FILE"
   exec > >(tee -a "$LOG") 2>&1
 
-  if [[ ${1:-} == --accounts-only ]]; then
+  if in_list --accounts-only "$@"; then
     show_plan 'accounts-only'
     printf 'This mode changes team passwords, audits PAM without editing it, and disables root after checks.\n'
     section_passwords || return 1
@@ -1324,3 +1449,4 @@ main() {
 }
 
 main "$@"
+
