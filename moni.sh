@@ -40,14 +40,17 @@ fi
 
 # --- Detect SSH client IP ---
 SSH_IP=""
+# Method 1: SSH_CLIENT env var (works without sudo or with sudo -E)
 if [[ -n ${SSH_CLIENT:-} ]]; then
     SSH_IP="${SSH_CLIENT%% *}"
-elif [[ -n ${SUDO_USER:-} ]]; then
-    SSH_IP=$(who | grep "$SUDO_USER" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1 || true)
 fi
+# Method 2: who am i (works under sudo)
 if [[ -z $SSH_IP ]]; then
-    SSH_IP=$(ss -tn state established '( sport = :22 )' 2>/dev/null \
-        | awk 'NR>1 {print $5}' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1 || true)
+    SSH_IP=$(who am i 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' || true)
+fi
+# Method 3: w command
+if [[ -z $SSH_IP ]]; then
+    SSH_IP=$(w -ih 2>/dev/null | awk '{print $3}' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1 || true)
 fi
 
 if [[ -n $SSH_IP ]]; then
